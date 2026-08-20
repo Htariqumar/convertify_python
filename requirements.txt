@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+pdf2docx
+pdfplumber
+pymupdf
+openpyxl
+python-pptx
+python-docx
+
+edge-tts==6.1.12
+faster-whisper
+imageio-ffmpeg
