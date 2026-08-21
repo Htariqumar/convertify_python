@@ -381,7 +381,7 @@ async def convert_text_to_speech(background_tasks: BackgroundTasks, request: TTS
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/convert/speech-to-text")
-async def convert_speech_to_text(file: UploadFile = File(...)):
+async def convert_speech_to_text(file: UploadFile = File(...), language: str = Form(None)):
     # Save the uploaded file temporarily
     fd_audio, temp_audio_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename)[1])
     os.close(fd_audio)
@@ -389,15 +389,22 @@ async def convert_speech_to_text(file: UploadFile = File(...)):
     try:
         with open(temp_audio_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
-        # Transcribe the audio
-        segments, info = whisper_model.transcribe(temp_audio_path, beam_size=5)
-        
+
+        # Auto-detection on the small "base" model can misfire for lower-resource
+        # languages (e.g. Urdu getting misdetected as Chinese) - when the caller
+        # knows the spoken language, passing it explicitly skips that guess and
+        # is noticeably more accurate than relying on auto-detect.
+        transcribe_kwargs = {"beam_size": 5}
+        if language:
+            transcribe_kwargs["language"] = language
+
+        segments, info = whisper_model.transcribe(temp_audio_path, **transcribe_kwargs)
+
         # Combine segments into full text
         full_text = ""
         for segment in segments:
             full_text += segment.text + " "
-            
+
         return {"text": full_text.strip(), "language": info.language}
     except Exception as e:
         return {"error": str(e)}
