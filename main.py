@@ -373,7 +373,11 @@ async def convert_text_to_speech(background_tasks: BackgroundTasks, request: TTS
         return FileResponse(path=temp_mp3_path, filename="speech.mp3", media_type="audio/mpeg")
     except Exception as e:
         remove_files([temp_mp3_path])
-        return {"error": str(e)}
+        # Must raise (not return a dict) so the response carries a non-200 status -
+        # the Next.js caller requests this as arraybuffer and can't tell a JSON
+        # error body from real audio bytes otherwise, so a 200 here silently
+        # saves the error message as if it were a working MP3.
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/convert/speech-to-text")
 async def convert_speech_to_text(file: UploadFile = File(...)):
