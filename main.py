@@ -373,6 +373,7 @@ async def convert_text_to_speech(background_tasks: BackgroundTasks, request: TTS
         return FileResponse(path=temp_mp3_path, filename="speech.mp3", media_type="audio/mpeg")
     except Exception as e:
         remove_files([temp_mp3_path])
+        print(f"[text-to-speech] edge-tts failed: {e}")
         # Must raise (not return a dict) so the response carries a non-200 status -
         # the Next.js caller requests this as arraybuffer and can't tell a JSON
         # error body from real audio bytes otherwise, so a 200 here silently
