@@ -3,7 +3,7 @@ uvicorn
 python-multipart
 pdf2docx
 pdfplumber
-pymupdf
+pymupdf>=1.23.3
 openpyxl
 python-pptx
 python-docx

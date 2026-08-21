@@ -119,102 +119,308 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
                 return False
 
         def convert_with_correct_spacing(pdf_path, docx_path):
-            out_doc = docx.Document()
-            pdf = fitz.open(pdf_path)
-            for page in pdf:
-                blocks = page.get_text("dict")["blocks"]
-                all_lines = []
-                for b in blocks:
-                    if b.get("type") == 0:
-                        for l in b.get("lines", []):
-                            spans = l.get("spans", [])
-                            if not spans: continue
-                            
-                            run_params = []
-                            last_x = None
-                            first_span = spans[0]
-                            font_size = first_span.get("size", 11)
-                            
-                            for s in spans:
-                                text = s.get("text", "")
-                                bbox = s.get("bbox", [0,0,0,0])
-                                
-                                if last_x is not None:
-                                    gap = bbox[0] - last_x
-                                    if gap > 2 and not text.startswith(" ") and not text.startswith(","):
-                                        run_params.append({"text": " ", "size": font_size, "font": first_span.get("font", ""), "flags": 0})
-                                
-                                run_params.append({"text": text, "size": s.get("size", 11), "font": s.get("font", "").lower(), "flags": s.get("flags", 0)})
-                                last_x = bbox[2]
-                                
-                            full_text = "".join(r["text"] for r in run_params).strip()
-                            all_lines.append({
-                                "bbox": l.get("bbox", [0,0,0,0]),
-                                "runs": run_params,
-                                "full_text": full_text,
-                                "font_size": font_size
-                            })
-                            
-                # Sort lines by approximate Y, then X
-                all_lines.sort(key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
-                
-                p = None
-                last_y_bottom = -999
-                last_font_size = -1
-                
-                for line in all_lines:
-                    if not line["full_text"]: continue
-                    
-                    bbox = line["bbox"]
-                    y_top = bbox[1]
-                    y_bottom = bbox[3]
-                    font_size = line["font_size"]
-                    vertical_gap = y_top - last_y_bottom
-                    
-                    is_bullet = line["full_text"].startswith(('•', '◦', '-', '*'))
-                    
-                    start_new_para = True
-                    if p is not None:
-                        if is_bullet:
-                            start_new_para = True
-                        elif y_top < (last_y_bottom - font_size * 0.3):
-                            # Column-based content (same row, right aligned)
-                            start_new_para = True
-                        elif vertical_gap < (font_size * 0.5) and abs(font_size - last_font_size) < 1.0:
-                            start_new_para = False
-                            
-                    if start_new_para:
-                        p = out_doc.add_paragraph()
-                    else:
-                        p.add_run(" ")
-                        
-                    import re
-                    def clean_font_name(f_str):
-                        name = f_str.split('+')[-1]
-                        name = re.sub(r'-(Bold|Italic|Regular|Medium|SemiBold|Light).*', '', name, flags=re.IGNORECASE)
-                        name = re.sub(r'(MT|PSMT|MS|PS)$', '', name, flags=re.IGNORECASE)
-                        name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
-                        return name.strip()
+            import re
+            from io import BytesIO
+            from collections import Counter
+            from docx.shared import Pt, Inches
+            from docx.oxml.ns import qn
+            from docx.oxml import OxmlElement
 
-                    for r in line["runs"]:
-                        run = p.add_run(r["text"])
-                        raw_font = r["font"]
-                        flags = r["flags"]
-                        
-                        if (flags & 16) or "bold" in raw_font or "black" in raw_font:
-                            run.bold = True
-                        if (flags & 2) or "italic" in raw_font:
-                            run.italic = True
-                            
-                        clean_name = clean_font_name(raw_font)
-                        if clean_name and clean_name.lower() != "unknown":
-                            run.font.name = clean_name
-                            
-                        if r["size"] > 0:
-                            run.font.size = docx.shared.Pt(round(r["size"]))
-                            
-                    last_y_bottom = y_bottom
-                    last_font_size = font_size
+            pdf = fitz.open(pdf_path)
+            out_doc = docx.Document()
+            section = out_doc.sections[0]
+            usable_width_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
+
+            def clean_font_name(f_str):
+                name = f_str.split('+')[-1]
+                name = re.sub(r'-(Bold|Italic|Regular|Medium|SemiBold|Light).*', '', name, flags=re.IGNORECASE)
+                name = re.sub(r'(MT|PSMT|MS|PS)$', '', name, flags=re.IGNORECASE)
+                name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+                return name.strip()
+
+            def add_page_number_field(paragraph):
+                run = paragraph.add_run()
+                begin = OxmlElement('w:fldChar'); begin.set(qn('w:fldCharType'), 'begin')
+                instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve'); instr.text = "PAGE"
+                end = OxmlElement('w:fldChar'); end.set(qn('w:fldCharType'), 'end')
+                run._r.append(begin); run._r.append(instr); run._r.append(end)
+
+            def apply_field_text(paragraph, sample):
+                m = re.search(r'\d+', sample)
+                if not m:
+                    paragraph.add_run(sample)
+                    return
+                paragraph.add_run(sample[:m.start()])
+                add_page_number_field(paragraph)
+                paragraph.add_run(sample[m.end():])
+
+            def overlap_ratio(a, b):
+                ax0, ay0, ax1, ay1 = a
+                bx0, by0, bx1, by1 = b
+                ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+                ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+                if ix1 <= ix0 or iy1 <= iy0:
+                    return 0.0
+                inter = (ix1 - ix0) * (iy1 - iy0)
+                area_a = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+                return inter / area_a
+
+            def detect_columns(items, page_x0, page_x1):
+                # Finds vertical whitespace gutters shared by most lines, so multi-column
+                # PDFs (magazines/papers) read top-to-bottom per column instead of
+                # interleaving alternating lines from the left and right columns.
+                page_width = page_x1 - page_x0
+                if page_width <= 0 or len(items) < 6:
+                    return [(page_x0, page_x1)]
+                bins = 80
+                bin_w = page_width / bins
+                covered = [False] * bins
+                for it in items:
+                    x0, x1 = it["bbox"][0], it["bbox"][2]
+                    b0 = max(0, int((x0 - page_x0) / bin_w))
+                    b1 = min(bins - 1, int((x1 - page_x0) / bin_w))
+                    for i in range(b0, b1 + 1):
+                        covered[i] = True
+                gaps = []
+                i = 0
+                while i < bins:
+                    if not covered[i]:
+                        j = i
+                        while j < bins and not covered[j]:
+                            j += 1
+                        gaps.append((page_x0 + i * bin_w, page_x0 + j * bin_w, i, j - 1))
+                        i = j
+                    else:
+                        i += 1
+                real_gaps = [g for g in gaps if (g[1] - g[0]) >= 12 and g[2] > 3 and g[3] < bins - 4]
+                if not real_gaps or len(real_gaps) > 2:
+                    return [(page_x0, page_x1)]
+                splits = sorted((g[0] + g[1]) / 2 for g in real_gaps)
+                bands, prev = [], page_x0
+                for s in splits:
+                    bands.append((prev, s))
+                    prev = s
+                bands.append((prev, page_x1))
+                counts = [sum(1 for it in items if bx0 <= (it["bbox"][0] + it["bbox"][2]) / 2 < bx1) for bx0, bx1 in bands]
+                total = sum(counts)
+                if total == 0 or min(counts) < max(2, total * 0.12):
+                    return [(page_x0, page_x1)]
+                return bands
+
+            def render_table(item, state):
+                rows = item["rows"]
+                max_cols = max(len(r) for r in rows)
+                table = out_doc.add_table(rows=len(rows), cols=max_cols)
+                table.style = "Table Grid"
+                for r_idx, row in enumerate(rows):
+                    for c_idx in range(max_cols):
+                        val = row[c_idx] if c_idx < len(row) and row[c_idx] is not None else ""
+                        table.cell(r_idx, c_idx).text = str(val).strip()
+                state["p"] = None
+                state["last_y_bottom"] = -999
+                state["last_font_size"] = -1
+
+            def render_image(item, state):
+                bbox = item["bbox"]
+                width_in = min((bbox[2] - bbox[0]) / 72.0, usable_width_in)
+                if width_in <= 0:
+                    width_in = usable_width_in
+                try:
+                    out_doc.add_picture(BytesIO(item["data"]), width=Inches(width_in))
+                except Exception:
+                    pass
+                state["p"] = None
+                state["last_y_bottom"] = -999
+                state["last_font_size"] = -1
+
+            def render_text(item, state):
+                bbox = item["bbox"]
+                y_top, y_bottom = bbox[1], bbox[3]
+                font_size = item["font_size"]
+                vertical_gap = y_top - state["last_y_bottom"]
+                is_bullet = item["full_text"].startswith(('•', '◦', '-', '*'))
+
+                start_new_para = True
+                if state["p"] is not None:
+                    if is_bullet:
+                        start_new_para = True
+                    elif y_top < (state["last_y_bottom"] - font_size * 0.3):
+                        start_new_para = True
+                    elif vertical_gap < (font_size * 0.5) and abs(font_size - state["last_font_size"]) < 1.0:
+                        start_new_para = False
+
+                if start_new_para:
+                    state["p"] = out_doc.add_paragraph()
+                else:
+                    state["p"].add_run(" ")
+
+                for r in item["runs"]:
+                    run = state["p"].add_run(r["text"])
+                    raw_font = r["font"]
+                    flags = r["flags"]
+                    if (flags & 16) or "bold" in raw_font or "black" in raw_font:
+                        run.bold = True
+                    if (flags & 2) or "italic" in raw_font:
+                        run.italic = True
+                    clean_name = clean_font_name(raw_font)
+                    if clean_name and clean_name.lower() != "unknown":
+                        run.font.name = clean_name
+                    if r["size"] > 0:
+                        run.font.size = Pt(round(r["size"]))
+
+                state["last_y_bottom"] = y_bottom
+                state["last_font_size"] = font_size
+
+            def render_band(band_items, page_x0, page_x1, state):
+                if not band_items:
+                    return
+                col_bands = detect_columns(band_items, page_x0, page_x1)
+                if len(col_bands) <= 1:
+                    ordered = sorted(band_items, key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
+                    for it in ordered:
+                        (render_image if it["type"] == "image" else render_text)(it, state)
+                    return
+                for bx0, bx1 in col_bands:
+                    col_items = [it for it in band_items if bx0 <= (it["bbox"][0] + it["bbox"][2]) / 2 < bx1]
+                    col_items.sort(key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
+                    for it in col_items:
+                        (render_image if it["type"] == "image" else render_text)(it, state)
+
+            page_count = len(pdf)
+
+            # ---- Pass 1: detect header/footer lines that repeat across most pages, so
+            # they land in Word's real header/footer instead of the document body. ----
+            top_counter, bottom_counter = Counter(), Counter()
+            top_samples, bottom_samples = {}, {}
+            for page in pdf:
+                h = page.rect.height
+                for b in page.get_text("dict")["blocks"]:
+                    if b.get("type") != 0:
+                        continue
+                    for l in b.get("lines", []):
+                        txt = "".join(s.get("text", "") for s in l.get("spans", [])).strip()
+                        if not txt:
+                            continue
+                        y0, y1 = l["bbox"][1], l["bbox"][3]
+                        norm = re.sub(r'\d+', '#', txt)
+                        if y1 < h * 0.10:
+                            top_counter[norm] += 1
+                            top_samples.setdefault(norm, txt)
+                        elif y0 > h * 0.90:
+                            bottom_counter[norm] += 1
+                            bottom_samples.setdefault(norm, txt)
+
+            repeat_threshold = max(2, int(page_count * 0.6))
+            header_patterns = {p for p, c in top_counter.items() if c >= repeat_threshold} if page_count >= 3 else set()
+            footer_patterns = {p for p, c in bottom_counter.items() if c >= repeat_threshold} if page_count >= 3 else set()
+
+            if header_patterns:
+                apply_field_text(section.header.paragraphs[0], top_samples[next(iter(header_patterns))])
+            if footer_patterns:
+                apply_field_text(section.footer.paragraphs[0], bottom_samples[next(iter(footer_patterns))])
+
+            # ---- Pass 2: rebuild the body page by page (real page breaks, tables,
+            # inline images and column-aware reading order) ----
+            for page_index, page in enumerate(pdf):
+                if page_index > 0:
+                    out_doc.add_page_break()
+
+                h = page.rect.height
+                page_x0, page_x1 = page.rect.x0, page.rect.x1
+
+                table_items = []
+                try:
+                    for t in page.find_tables().tables:
+                        try:
+                            rows = t.extract()
+                        except Exception:
+                            continue
+                        if rows:
+                            table_items.append({"type": "table", "bbox": list(t.bbox), "rows": rows})
+                except Exception:
+                    pass
+
+                image_items = []
+                for img_info in page.get_images(full=True):
+                    xref = img_info[0]
+                    try:
+                        rects = page.get_image_rects(xref) or []
+                    except Exception:
+                        rects = []
+                    if not rects:
+                        continue
+                    try:
+                        pix = fitz.Pixmap(pdf, xref)
+                        if pix.n - pix.alpha >= 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        img_bytes = pix.tobytes("png")
+                    except Exception:
+                        continue
+                    for rect in rects:
+                        rbbox = [rect[0], rect[1], rect[2], rect[3]]
+                        if (rbbox[2] - rbbox[0]) < 5 or (rbbox[3] - rbbox[1]) < 5:
+                            continue
+                        if any(overlap_ratio(rbbox, t["bbox"]) > 0.5 for t in table_items):
+                            continue
+                        image_items.append({"type": "image", "bbox": rbbox, "data": img_bytes})
+
+                text_items = []
+                for b in page.get_text("dict")["blocks"]:
+                    if b.get("type") != 0:
+                        continue
+                    for l in b.get("lines", []):
+                        spans = l.get("spans", [])
+                        if not spans:
+                            continue
+                        bbox = l.get("bbox", [0, 0, 0, 0])
+                        raw_text = "".join(s.get("text", "") for s in spans).strip()
+                        if not raw_text:
+                            continue
+                        norm = re.sub(r'\d+', '#', raw_text)
+                        in_header_zone = bbox[3] < h * 0.10
+                        in_footer_zone = bbox[1] > h * 0.90
+                        if (in_header_zone and norm in header_patterns) or (in_footer_zone and norm in footer_patterns):
+                            continue
+                        if any(overlap_ratio(bbox, t["bbox"]) > 0.5 for t in table_items):
+                            continue
+
+                        run_params = []
+                        last_x = None
+                        first_span = spans[0]
+                        font_size = first_span.get("size", 11)
+
+                        for s in spans:
+                            text = s.get("text", "")
+                            sbbox = s.get("bbox", [0, 0, 0, 0])
+
+                            if last_x is not None:
+                                gap = sbbox[0] - last_x
+                                if gap > 2 and not text.startswith(" ") and not text.startswith(","):
+                                    run_params.append({"text": " ", "size": font_size, "font": first_span.get("font", ""), "flags": 0})
+
+                            run_params.append({"text": text, "size": s.get("size", 11), "font": s.get("font", "").lower(), "flags": s.get("flags", 0)})
+                            last_x = sbbox[2]
+
+                        full_text = "".join(r["text"] for r in run_params).strip()
+                        if not full_text:
+                            continue
+                        text_items.append({"type": "text", "bbox": bbox, "runs": run_params, "full_text": full_text, "font_size": font_size})
+
+                content_width = max((it["bbox"][2] for it in (text_items + image_items)), default=page_x1) - page_x0
+                flowable = sorted(text_items + image_items + table_items, key=lambda it: (round(it["bbox"][1] / 5), it["bbox"][0]))
+
+                state = {"p": None, "last_y_bottom": -999, "last_font_size": -1}
+                band = []
+                for it in flowable:
+                    is_break = it["type"] == "table" or (it["type"] == "image" and (it["bbox"][2] - it["bbox"][0]) >= 0.7 * max(content_width, 1))
+                    if is_break:
+                        render_band(band, page_x0, page_x1, state)
+                        band = []
+                        (render_table if it["type"] == "table" else render_image)(it, state)
+                    else:
+                        band.append(it)
+                render_band(band, page_x0, page_x1, state)
+
             out_doc.save(docx_path)
         
         # 1. Primary conversion using pdf2docx (Best for formatting)
