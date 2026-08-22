@@ -118,6 +118,47 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
             except:
                 return False
 
+        def fix_glued_words_in_docx(docx_path):
+            # pdf2docx occasionally drops the space between words (common on
+            # Canva-exported PDFs, justified text, etc.), which has_spacing_issue()
+            # detects. Rather than throwing away pdf2docx's layout (tables, images,
+            # columns, fonts - all correct) and rebuilding the page from scratch,
+            # try a much cheaper surgical fix first: re-segment only the glued
+            # tokens in place with a dictionary-based word splitter, leaving every
+            # other run and all formatting untouched. Falls back to the full
+            # from-scratch rebuild only if this doesn't clear the issue.
+            import wordninja
+
+            def split_token(token):
+                if not token.isalpha() or len(token) < 15:
+                    return token
+                parts = wordninja.split(token)
+                if len(parts) <= 1 or ''.join(parts) != token:
+                    return token
+                return ' '.join(parts)
+
+            def fix_paragraphs(paragraphs):
+                for para in paragraphs:
+                    for run in para.runs:
+                        if not run.text:
+                            continue
+                        words = run.text.split(' ')
+                        fixed = [split_token(w) for w in words]
+                        if fixed != words:
+                            run.text = ' '.join(fixed)
+
+            try:
+                doc = docx.Document(docx_path)
+                fix_paragraphs(doc.paragraphs)
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            fix_paragraphs(cell.paragraphs)
+                doc.save(docx_path)
+                return not has_spacing_issue(docx_path)
+            except:
+                return False
+
         def convert_with_correct_spacing(pdf_path, docx_path):
             import re
             from io import BytesIO
@@ -431,8 +472,11 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
         # 2. Check and fallback (Fixes spacing issues on Canva PDFs with heuristics)
         used_method = "layout-mode"
         if has_spacing_issue(temp_docx_path):
-            convert_with_correct_spacing(temp_pdf_path, temp_docx_path)
-            used_method = "text-mode"
+            if fix_glued_words_in_docx(temp_docx_path):
+                used_method = "layout-mode-corrected"
+            else:
+                convert_with_correct_spacing(temp_pdf_path, temp_docx_path)
+                used_method = "text-mode"
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_docx_path])
         return FileResponse(
