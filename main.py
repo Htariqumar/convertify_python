@@ -7,6 +7,7 @@ from pptx import Presentation
 import fitz # PyMuPDF
 import tempfile
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -49,19 +50,58 @@ def remove_files(paths):
             print(f"Error removing {path}: {e}")
 
 
-def convert_with_soffice(input_path: str, output_dir: str) -> str:
-    """Converts a document to PDF via headless LibreOffice. Used for word/excel/ppt -> pdf."""
-    result = subprocess.run(
-        [SOFFICE_BIN, "--headless", "--norestore", "--convert-to", "pdf", "--outdir", output_dir, input_path],
-        capture_output=True,
-        timeout=100,
-    )
+def convert_with_soffice(input_path: str, output_dir: str, target_format: str = "pdf") -> str:
+    """Converts a document to the given format via headless LibreOffice (e.g. word/excel/ppt -> pdf,
+    or pdf -> docx). Each call gets its own -env:UserInstallation profile dir so concurrent requests
+    don't collide on LibreOffice's single-instance profile lock."""
+    profile_dir = tempfile.mkdtemp()
+    try:
+        result = subprocess.run(
+            [
+                SOFFICE_BIN, "--headless", "--norestore",
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to", target_format, "--outdir", output_dir, input_path,
+            ],
+            capture_output=True,
+            timeout=100,
+        )
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    output_path = os.path.join(output_dir, f"{base_name}.pdf")
+    output_path = os.path.join(output_dir, f"{base_name}.{target_format}")
     if result.returncode != 0 or not os.path.exists(output_path):
         stderr = result.stderr.decode(errors="ignore") if result.stderr else "unknown error"
         raise RuntimeError(f"LibreOffice conversion failed: {stderr}")
     return output_path
+
+
+def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
+    """Force Calc's 'fit sheet to page width' plus a tight print area before handing off
+    to LibreOffice. Headless --convert-to otherwise leaves pagination entirely to whatever
+    the workbook happened to save - for most files exported from a web app or built from
+    scraped/pasted data that's nothing, so a wide sheet gets sliced across several PDF
+    pages mid-table instead of shrinking to fit one page wide, the way Excel's own
+    print preview normally behaves."""
+    if ext not in (".xlsx", ".xlsm"):
+        return
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(input_path)
+        for ws in wb.worksheets:
+            if ws.max_row < 1 or ws.max_column < 1:
+                continue
+            ws.print_area = ws.dimensions
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            if ws.max_column > 8:
+                ws.page_setup.orientation = "landscape"
+        wb.save(input_path)
+    except Exception as e:
+        # Best-effort only - if the workbook can't be parsed (password-protected,
+        # unusual dialect), fall back to LibreOffice's default conversion rather than
+        # failing the whole request.
+        print(f"[excel-to-pdf] print-setup pre-processing skipped: {e}")
 
 
 async def office_to_pdf_response(background_tasks: BackgroundTasks, file: UploadFile) -> FileResponse:
@@ -75,6 +115,8 @@ async def office_to_pdf_response(background_tasks: BackgroundTasks, file: Upload
     try:
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+
+        prepare_excel_for_pdf(input_path, ext)
 
         output_path = convert_with_soffice(input_path, work_dir)
 
@@ -464,12 +506,11 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
 
             out_doc.save(docx_path)
         
-        # 1. Primary conversion using pdf2docx (Best for formatting)
+        # 1. Primary conversion using pdf2docx (fast, good enough for most straightforward PDFs)
         cv = Converter(temp_pdf_path)
         cv.convert(temp_docx_path, start=0, end=None)
         cv.close()
-        
-        # 2. Check and fallback (Fixes spacing issues on Canva PDFs with heuristics)
+
         used_method = "layout-mode"
         if has_spacing_issue(temp_docx_path):
             if fix_glued_words_in_docx(temp_docx_path):
@@ -489,45 +530,154 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
         remove_files([temp_pdf_path, temp_docx_path])
         raise HTTPException(status_code=500, detail=str(e))
 
+def _pdf_cell_to_excel(raw):
+    """Turn a scraped table cell into a native Excel type (+ number format) where it's
+    unambiguously safe to do so, so numbers land as real numbers (sortable/summable,
+    right-aligned) instead of importing as text - the single biggest visible gap between
+    a scraped-looking sheet and one a person typed by hand. Returns (value, number_format)."""
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if text == "":
+        return None, None
+    # Leading-zero strings are almost always identifiers (zip codes, IDs), not numbers -
+    # converting "00123" to 123 would silently corrupt the data.
+    if re.fullmatch(r"0\d+", text):
+        return text, None
+    cleaned = text
+    is_negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if is_negative:
+        cleaned = cleaned[1:-1]
+    cleaned = cleaned.replace(",", "")
+    is_percent = cleaned.endswith("%")
+    if is_percent:
+        cleaned = cleaned[:-1]
+    currency_match = re.match(r"^([$€£])", cleaned)
+    if currency_match:
+        cleaned = cleaned[1:]
+    if not re.fullmatch(r"-?\d+(\.\d+)?", cleaned or ""):
+        return text, None
+    num = float(cleaned)
+    if is_negative:
+        num = -num
+    if is_percent:
+        return num / 100, "0.00%"
+    if currency_match:
+        return num, f'{currency_match.group(1)}#,##0.00'
+    if num == int(num) and "." not in cleaned:
+        return int(num), None
+    return num, None
+
+
 @app.post("/convert/pdf-to-excel")
 async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fd_pdf, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
     fd_xlsx, temp_xlsx_path = tempfile.mkstemp(suffix=".xlsx")
-    
+
     os.close(fd_pdf)
     os.close(fd_xlsx)
 
     try:
         with open(temp_pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
+
         from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
         import pdfplumber
-        
+
         wb = Workbook()
         ws = wb.active
-        
+        header_font = Font(bold=True)
+        max_col_widths = {}
+
+        def write_row(row_idx, values, bold=False):
+            for col_idx, raw in enumerate(values, start=1):
+                value, number_format = _pdf_cell_to_excel(raw)
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                if number_format:
+                    cell.number_format = number_format
+                if bold:
+                    cell.font = header_font
+                width = len(str(raw)) if raw is not None else 0
+                if width > max_col_widths.get(col_idx, 0):
+                    max_col_widths[col_idx] = width
+
+        current_row = 1
+        prev_num_cols = None
+        prev_header = None
+
         with pdfplumber.open(temp_pdf_path) as pdf:
-            tables_found = False
             for page in pdf.pages:
-                tables = page.extract_tables()
-                if tables:
-                    for table in tables:
-                        tables_found = True
-                        for row in table:
-                            clean_row = [cell if cell is not None else "" for cell in row]
-                            ws.append(clean_row)
-                        ws.append([]) # empty row between tables
-            
-            # Fallback: if no tables are found (e.g. resumes), extract text line-by-line
-            if not tables_found:
-                for page in pdf.pages:
-                    text = page.extract_text()
+                tables = [t for t in page.extract_tables() if t]
+
+                if not tables:
+                    # Fallback for this page: no ruled table detected (e.g. a resume
+                    # page or a plain-text page in an otherwise tabular report). Split
+                    # on runs of 2+ spaces/tabs so whitespace-aligned columns still
+                    # land in separate cells instead of one giant column. Scoped to
+                    # the page (not the whole document) so a document that mixes
+                    # tables and prose pages doesn't silently drop the prose ones.
+                    # layout=True preserves the PDF's original horizontal gaps between
+                    # words - plain extract_text() collapses any run of whitespace to
+                    # a single space, which would erase the very column alignment this
+                    # fallback relies on to split lines into cells.
+                    text = page.extract_text(layout=True)
                     if text:
-                        for line in text.split('\n'):
-                            ws.append([line.strip()])
-                        ws.append([])
-                        
+                        # layout mode represents the page's top/bottom margins as blank
+                        # lines (it maps the full page height to a text grid) - trim
+                        # those so the sheet doesn't open with a run of empty rows
+                        # before the actual content. Blank lines *within* the content
+                        # are kept since those are real paragraph/section breaks.
+                        lines = text.split('\n')
+                        while lines and not lines[0].strip():
+                            lines.pop(0)
+                        while lines and not lines[-1].strip():
+                            lines.pop()
+
+                        if lines and prev_num_cols is not None:
+                            current_row += 1
+                        for line in lines:
+                            if not line.strip():
+                                current_row += 1
+                                continue
+                            parts = re.split(r"\s{2,}|\t", line.strip())
+                            write_row(current_row, parts)
+                            current_row += 1
+                        prev_num_cols = None
+                        prev_header = None
+                    continue
+
+                for table in tables:
+                    raw_rows = [["" if c is None else str(c).strip() for c in row] for row in table]
+                    num_cols = len(raw_rows[0]) if raw_rows else 0
+
+                    # A table that resumes on the next page re-extracts with the same
+                    # column count and a repeated header row - treat it as a continuation
+                    # of the previous block (no blank separator, no duplicate header)
+                    # rather than a brand-new table.
+                    is_continuation = (
+                        prev_num_cols == num_cols
+                        and prev_header is not None
+                        and raw_rows
+                        and raw_rows[0] == prev_header
+                    )
+
+                    rows_to_write = raw_rows[1:] if is_continuation else raw_rows
+                    if not is_continuation and prev_num_cols is not None:
+                        current_row += 1  # blank row between genuinely distinct tables
+
+                    for i, row in enumerate(rows_to_write):
+                        is_header_row = not is_continuation and i == 0
+                        write_row(current_row, row, bold=is_header_row)
+                        current_row += 1
+
+                    prev_num_cols = num_cols
+                    prev_header = raw_rows[0] if raw_rows else None
+
+        for col_idx, width in max_col_widths.items():
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width + 2, 8), 60)
+
         wb.save(temp_xlsx_path)
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_xlsx_path])
