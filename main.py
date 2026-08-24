@@ -612,39 +612,130 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
                 tables = [t for t in page.extract_tables() if t]
 
                 if not tables:
-                    # Fallback for this page: no ruled table detected (e.g. a resume
-                    # page or a plain-text page in an otherwise tabular report). Split
-                    # on runs of 2+ spaces/tabs so whitespace-aligned columns still
-                    # land in separate cells instead of one giant column. Scoped to
-                    # the page (not the whole document) so a document that mixes
-                    # tables and prose pages doesn't silently drop the prose ones.
-                    # layout=True preserves the PDF's original horizontal gaps between
-                    # words - plain extract_text() collapses any run of whitespace to
-                    # a single space, which would erase the very column alignment this
-                    # fallback relies on to split lines into cells.
-                    text = page.extract_text(layout=True)
-                    if text:
-                        # layout mode represents the page's top/bottom margins as blank
-                        # lines (it maps the full page height to a text grid) - trim
-                        # those so the sheet doesn't open with a run of empty rows
-                        # before the actual content. Blank lines *within* the content
-                        # are kept since those are real paragraph/section breaks.
-                        lines = text.split('\n')
-                        while lines and not lines[0].strip():
-                            lines.pop(0)
-                        while lines and not lines[-1].strip():
-                            lines.pop()
+                    # Robust unruled / borderless table column-region extraction:
+                    # Detects vertical column channels across the page by analyzing word coordinates,
+                    # intra-phrase spacing, and alignments. Ensures that right-aligned numbers
+                    # (e.g. Age: 32) and adjacent date columns (e.g. 15/10/2017) or names (First/Last)
+                    # never merge into one cell.
+                    extracted_rows = []
+                    words = page.extract_words(x_tolerance=1, y_tolerance=1)
+                    if words:
+                        lines = []
+                        current_line = []
+                        for w in sorted(words, key=lambda x: (x['top'], x['x0'])):
+                            if not current_line:
+                                current_line.append(w)
+                            else:
+                                if abs(w['top'] - current_line[0]['top']) <= 4.0:
+                                    current_line.append(w)
+                                else:
+                                    lines.append(sorted(current_line, key=lambda x: x['x0']))
+                                    current_line = [w]
+                        if current_line:
+                            lines.append(sorted(current_line, key=lambda x: x['x0']))
 
-                        if lines and prev_num_cols is not None:
-                            current_row += 1
+                        table_lines = []
                         for line in lines:
-                            if not line.strip():
-                                current_row += 1
+                            if len(line) == 1 and line[0]['text'] in ['Sheet1', 'Page']:
                                 continue
-                            parts = re.split(r"\s{2,}|\t", line.strip())
-                            write_row(current_row, parts)
+                            if len(line) <= 2 and 'Page' in [w['text'] for w in line]:
+                                continue
+                            table_lines.append(line)
+
+                        if table_lines:
+                            line_phrases = []
+                            for line in table_lines:
+                                phrases = []
+                                cur_phrase = []
+                                for w in line:
+                                    if not cur_phrase:
+                                        cur_phrase.append(w)
+                                    else:
+                                        prev_w = cur_phrase[-1]
+                                        gap = w['x0'] - prev_w['x1']
+                                        if gap <= 3.2:
+                                            cur_phrase.append(w)
+                                        else:
+                                            phrases.append(cur_phrase)
+                                            cur_phrase = [w]
+                                if cur_phrase:
+                                    phrases.append(cur_phrase)
+                                line_phrases.append(phrases)
+
+                            all_intervals = []
+                            for phrases in line_phrases:
+                                for p in phrases:
+                                    all_intervals.append((p[0]['x0'], p[-1]['x1']))
+
+                            page_w = int(page.width) + 1
+                            coverage = [0] * page_w
+                            for x0, x1 in all_intervals:
+                                for x in range(max(0, int(x0 + 0.5)), min(page_w, int(x1 + 0.5))):
+                                    coverage[x] += 1
+
+                            active_regions = []
+                            in_active = False
+                            reg_start = 0
+                            for x in range(page_w):
+                                if coverage[x] > 0 and not in_active:
+                                    in_active = True
+                                    reg_start = x
+                                elif coverage[x] == 0 and in_active:
+                                    in_active = False
+                                    active_regions.append([reg_start, x])
+                            if in_active:
+                                active_regions.append([reg_start, page_w])
+
+                            # Merge complementary sub-tracks (e.g. left-aligned header + right-aligned numbers)
+                            merged_regions = []
+                            i = 0
+                            while i < len(active_regions):
+                                cur_start, cur_end = active_regions[i]
+                                if i + 1 < len(active_regions):
+                                    next_start, next_end = active_regions[i + 1]
+                                    overlap = False
+                                    for phrases in line_phrases:
+                                        has_cur = any(cur_start - 2 <= (p[0]['x0']+p[-1]['x1'])/2 <= cur_end + 2 for p in phrases)
+                                        has_next = any(next_start - 2 <= (p[0]['x0']+p[-1]['x1'])/2 <= next_end + 2 for p in phrases)
+                                        if has_cur and has_next:
+                                            overlap = True
+                                            break
+                                    if not overlap and (next_end - cur_start) < 100:
+                                        merged_regions.append([cur_start, next_end])
+                                        i += 2
+                                        continue
+                                merged_regions.append([cur_start, cur_end])
+                                i += 1
+
+                            for phrases in line_phrases:
+                                row_cells = [[] for _ in merged_regions]
+                                for p in phrases:
+                                    p_text = " ".join([w['text'] for w in p])
+                                    p_mid = (p[0]['x0'] + p[-1]['x1']) / 2.0
+                                    matched_idx = -1
+                                    for idx, (t_start, t_end) in enumerate(merged_regions):
+                                        if t_start - 2 <= p_mid <= t_end + 2:
+                                            matched_idx = idx
+                                            break
+                                    if matched_idx == -1:
+                                        distances = [abs(p_mid - (t_start + t_end)/2.0) for t_start, t_end in merged_regions]
+                                        matched_idx = distances.index(min(distances))
+                                    row_cells[matched_idx].append(p_text)
+
+                                row = [" ".join(c) if c else "" for c in row_cells]
+                                while row and row[-1] == "":
+                                    row.pop()
+                                if any(row):
+                                    extracted_rows.append(row)
+
+                    if extracted_rows:
+                        if prev_num_cols is not None:
                             current_row += 1
-                        prev_num_cols = None
+                        for i, row in enumerate(extracted_rows):
+                            is_header = (i == 0 and len(row) > 1)
+                            write_row(current_row, row, bold=is_header)
+                            current_row += 1
+                        prev_num_cols = len(extracted_rows[0]) if extracted_rows else None
                         prev_header = None
                     continue
 
