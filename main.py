@@ -8,6 +8,7 @@ from pptx import Presentation
 import fitz # PyMuPDF
 import tempfile
 import os
+from pathlib import Path
 import re
 import secrets
 import shutil
@@ -85,10 +86,18 @@ def convert_with_soffice(input_path: str, output_dir: str, target_format: str = 
     don't collide on LibreOffice's single-instance profile lock."""
     profile_dir = tempfile.mkdtemp()
     try:
+        # Path(...).as_uri() (not a manual f"file://{profile_dir}") because that manual form is
+        # only a valid URI on POSIX - on Windows a raw path like "C:\Users\...\tmp" produces
+        # "file://C:\Users\...\tmp", which isn't a well-formed file URI (drive letter without
+        # the required extra slash, backslashes instead of forward slashes). LibreOffice then
+        # fails to parse it and exits with code 1 and no stderr output at all, which is exactly
+        # what running this in local Windows dev (rather than the Linux Docker/Railway host)
+        # surfaces - as_uri() produces the correct form on both platforms.
+        profile_uri = Path(profile_dir).as_uri()
         result = subprocess.run(
             [
                 SOFFICE_BIN, "--headless", "--norestore",
-                f"-env:UserInstallation=file://{profile_dir}",
+                f"-env:UserInstallation={profile_uri}",
                 "--convert-to", target_format, "--outdir", output_dir, input_path,
             ],
             capture_output=True,
