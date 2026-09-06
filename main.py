@@ -133,21 +133,30 @@ def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
         print(f"[excel-to-pdf] print-setup pre-processing skipped: {e}")
 
 
+def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
+    """The actual blocking work for word/excel/ppt -> pdf: writes the upload to disk and
+    runs it through LibreOffice. Must be called via run_in_threadpool - convert_with_soffice()
+    can take up to its 100s subprocess timeout, and calling it directly on the event loop
+    would freeze every other request this service is handling (every other conversion tool,
+    for every other user) for that entire duration."""
+    input_path = os.path.join(work_dir, f"input{ext}")
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    prepare_excel_for_pdf(input_path, ext)
+
+    return convert_with_soffice(input_path, work_dir)
+
+
 async def office_to_pdf_response(background_tasks: BackgroundTasks, file: UploadFile) -> FileResponse:
     """Shared handler for word/excel/ppt -> pdf: saves the upload, converts via LibreOffice,
     and returns the resulting PDF. Keeps the original extension so LibreOffice picks the
     right import filter (works for both legacy .doc/.xls/.ppt and modern .docx/.xlsx/.pptx)."""
     ext = os.path.splitext(file.filename or "")[1] or ".tmp"
     work_dir = tempfile.mkdtemp()
-    input_path = os.path.join(work_dir, f"input{ext}")
 
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        prepare_excel_for_pdf(input_path, ext)
-
-        output_path = convert_with_soffice(input_path, work_dir)
+        output_path = await run_in_threadpool(_office_to_pdf_sync, file.file, ext, work_dir)
 
         background_tasks.add_task(shutil.rmtree, work_dir, True)
         return FileResponse(path=output_path, filename=f"converted_{file.filename}.pdf", media_type="application/pdf")
@@ -155,403 +164,413 @@ async def office_to_pdf_response(background_tasks: BackgroundTasks, file: Upload
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str) -> str:
+    """All the blocking work for pdf-to-word: writing the upload to disk, the pdf2docx
+    conversion, and the spacing-fix passes below (all synchronous, CPU/IO-bound). Must be
+    called via run_in_threadpool - otherwise a large/complex PDF blocks every other request
+    this service is handling (every other conversion tool, for every other user) for
+    however long the conversion takes."""
+    # Write the uploaded file to the temp PDF path
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    from pdf2docx import Converter
+    import docx
+    import fitz
+
+    def has_spacing_issue(docx_path):
+        try:
+            doc = docx.Document(docx_path)
+            long_words = 0
+            total_words = 0
+            for para in doc.paragraphs:
+                words = para.text.split()
+                for w in words:
+                    total_words += 1
+                    if len(w) >= 15:
+                        long_words += 1
+            if total_words == 0: return False
+            return (long_words / total_words) > 0.05
+        except:
+            return False
+
+    def fix_glued_words_in_docx(docx_path):
+        # pdf2docx occasionally drops the space between words (common on
+        # Canva-exported PDFs, justified text, etc.), which has_spacing_issue()
+        # detects. Rather than throwing away pdf2docx's layout (tables, images,
+        # columns, fonts - all correct) and rebuilding the page from scratch,
+        # try a much cheaper surgical fix first: re-segment only the glued
+        # tokens in place with a dictionary-based word splitter, leaving every
+        # other run and all formatting untouched. Falls back to the full
+        # from-scratch rebuild only if this doesn't clear the issue.
+        import wordninja
+
+        def split_token(token):
+            if not token.isalpha() or len(token) < 15:
+                return token
+            parts = wordninja.split(token)
+            if len(parts) <= 1 or ''.join(parts) != token:
+                return token
+            return ' '.join(parts)
+
+        def fix_paragraphs(paragraphs):
+            for para in paragraphs:
+                for run in para.runs:
+                    if not run.text:
+                        continue
+                    words = run.text.split(' ')
+                    fixed = [split_token(w) for w in words]
+                    if fixed != words:
+                        run.text = ' '.join(fixed)
+
+        try:
+            doc = docx.Document(docx_path)
+            fix_paragraphs(doc.paragraphs)
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        fix_paragraphs(cell.paragraphs)
+            doc.save(docx_path)
+            return not has_spacing_issue(docx_path)
+        except:
+            return False
+
+    def convert_with_correct_spacing(pdf_path, docx_path):
+        import re
+        from io import BytesIO
+        from collections import Counter
+        from docx.shared import Pt, Inches
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+
+        pdf = fitz.open(pdf_path)
+        out_doc = docx.Document()
+        section = out_doc.sections[0]
+        usable_width_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
+
+        def clean_font_name(f_str):
+            name = f_str.split('+')[-1]
+            name = re.sub(r'-(Bold|Italic|Regular|Medium|SemiBold|Light).*', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'(MT|PSMT|MS|PS)$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+            return name.strip()
+
+        def add_page_number_field(paragraph):
+            run = paragraph.add_run()
+            begin = OxmlElement('w:fldChar'); begin.set(qn('w:fldCharType'), 'begin')
+            instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve'); instr.text = "PAGE"
+            end = OxmlElement('w:fldChar'); end.set(qn('w:fldCharType'), 'end')
+            run._r.append(begin); run._r.append(instr); run._r.append(end)
+
+        def apply_field_text(paragraph, sample):
+            m = re.search(r'\d+', sample)
+            if not m:
+                paragraph.add_run(sample)
+                return
+            paragraph.add_run(sample[:m.start()])
+            add_page_number_field(paragraph)
+            paragraph.add_run(sample[m.end():])
+
+        def overlap_ratio(a, b):
+            ax0, ay0, ax1, ay1 = a
+            bx0, by0, bx1, by1 = b
+            ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+            ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                return 0.0
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            area_a = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+            return inter / area_a
+
+        def detect_columns(items, page_x0, page_x1):
+            # Finds vertical whitespace gutters shared by most lines, so multi-column
+            # PDFs (magazines/papers) read top-to-bottom per column instead of
+            # interleaving alternating lines from the left and right columns.
+            page_width = page_x1 - page_x0
+            if page_width <= 0 or len(items) < 6:
+                return [(page_x0, page_x1)]
+            bins = 80
+            bin_w = page_width / bins
+            covered = [False] * bins
+            for it in items:
+                x0, x1 = it["bbox"][0], it["bbox"][2]
+                b0 = max(0, int((x0 - page_x0) / bin_w))
+                b1 = min(bins - 1, int((x1 - page_x0) / bin_w))
+                for i in range(b0, b1 + 1):
+                    covered[i] = True
+            gaps = []
+            i = 0
+            while i < bins:
+                if not covered[i]:
+                    j = i
+                    while j < bins and not covered[j]:
+                        j += 1
+                    gaps.append((page_x0 + i * bin_w, page_x0 + j * bin_w, i, j - 1))
+                    i = j
+                else:
+                    i += 1
+            real_gaps = [g for g in gaps if (g[1] - g[0]) >= 12 and g[2] > 3 and g[3] < bins - 4]
+            if not real_gaps or len(real_gaps) > 2:
+                return [(page_x0, page_x1)]
+            splits = sorted((g[0] + g[1]) / 2 for g in real_gaps)
+            bands, prev = [], page_x0
+            for s in splits:
+                bands.append((prev, s))
+                prev = s
+            bands.append((prev, page_x1))
+            counts = [sum(1 for it in items if bx0 <= (it["bbox"][0] + it["bbox"][2]) / 2 < bx1) for bx0, bx1 in bands]
+            total = sum(counts)
+            if total == 0 or min(counts) < max(2, total * 0.12):
+                return [(page_x0, page_x1)]
+            return bands
+
+        def render_table(item, state):
+            rows = item["rows"]
+            max_cols = max(len(r) for r in rows)
+            table = out_doc.add_table(rows=len(rows), cols=max_cols)
+            table.style = "Table Grid"
+            for r_idx, row in enumerate(rows):
+                for c_idx in range(max_cols):
+                    val = row[c_idx] if c_idx < len(row) and row[c_idx] is not None else ""
+                    table.cell(r_idx, c_idx).text = str(val).strip()
+            state["p"] = None
+            state["last_y_bottom"] = -999
+            state["last_font_size"] = -1
+
+        def render_image(item, state):
+            bbox = item["bbox"]
+            width_in = min((bbox[2] - bbox[0]) / 72.0, usable_width_in)
+            if width_in <= 0:
+                width_in = usable_width_in
+            try:
+                out_doc.add_picture(BytesIO(item["data"]), width=Inches(width_in))
+            except Exception:
+                pass
+            state["p"] = None
+            state["last_y_bottom"] = -999
+            state["last_font_size"] = -1
+
+        def render_text(item, state):
+            bbox = item["bbox"]
+            y_top, y_bottom = bbox[1], bbox[3]
+            font_size = item["font_size"]
+            vertical_gap = y_top - state["last_y_bottom"]
+            is_bullet = item["full_text"].startswith(('•', '◦', '-', '*'))
+
+            start_new_para = True
+            if state["p"] is not None:
+                if is_bullet:
+                    start_new_para = True
+                elif y_top < (state["last_y_bottom"] - font_size * 0.3):
+                    start_new_para = True
+                elif vertical_gap < (font_size * 0.5) and abs(font_size - state["last_font_size"]) < 1.0:
+                    start_new_para = False
+
+            if start_new_para:
+                state["p"] = out_doc.add_paragraph()
+            else:
+                state["p"].add_run(" ")
+
+            for r in item["runs"]:
+                run = state["p"].add_run(r["text"])
+                raw_font = r["font"]
+                flags = r["flags"]
+                if (flags & 16) or "bold" in raw_font or "black" in raw_font:
+                    run.bold = True
+                if (flags & 2) or "italic" in raw_font:
+                    run.italic = True
+                clean_name = clean_font_name(raw_font)
+                if clean_name and clean_name.lower() != "unknown":
+                    run.font.name = clean_name
+                if r["size"] > 0:
+                    run.font.size = Pt(round(r["size"]))
+
+            state["last_y_bottom"] = y_bottom
+            state["last_font_size"] = font_size
+
+        def render_band(band_items, page_x0, page_x1, state):
+            if not band_items:
+                return
+            col_bands = detect_columns(band_items, page_x0, page_x1)
+            if len(col_bands) <= 1:
+                ordered = sorted(band_items, key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
+                for it in ordered:
+                    (render_image if it["type"] == "image" else render_text)(it, state)
+                return
+            for bx0, bx1 in col_bands:
+                col_items = [it for it in band_items if bx0 <= (it["bbox"][0] + it["bbox"][2]) / 2 < bx1]
+                col_items.sort(key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
+                for it in col_items:
+                    (render_image if it["type"] == "image" else render_text)(it, state)
+
+        page_count = len(pdf)
+
+        # ---- Pass 1: detect header/footer lines that repeat across most pages, so
+        # they land in Word's real header/footer instead of the document body. ----
+        top_counter, bottom_counter = Counter(), Counter()
+        top_samples, bottom_samples = {}, {}
+        for page in pdf:
+            h = page.rect.height
+            for b in page.get_text("dict")["blocks"]:
+                if b.get("type") != 0:
+                    continue
+                for l in b.get("lines", []):
+                    txt = "".join(s.get("text", "") for s in l.get("spans", [])).strip()
+                    if not txt:
+                        continue
+                    y0, y1 = l["bbox"][1], l["bbox"][3]
+                    norm = re.sub(r'\d+', '#', txt)
+                    if y1 < h * 0.10:
+                        top_counter[norm] += 1
+                        top_samples.setdefault(norm, txt)
+                    elif y0 > h * 0.90:
+                        bottom_counter[norm] += 1
+                        bottom_samples.setdefault(norm, txt)
+
+        repeat_threshold = max(2, int(page_count * 0.6))
+        header_patterns = {p for p, c in top_counter.items() if c >= repeat_threshold} if page_count >= 3 else set()
+        footer_patterns = {p for p, c in bottom_counter.items() if c >= repeat_threshold} if page_count >= 3 else set()
+
+        if header_patterns:
+            apply_field_text(section.header.paragraphs[0], top_samples[next(iter(header_patterns))])
+        if footer_patterns:
+            apply_field_text(section.footer.paragraphs[0], bottom_samples[next(iter(footer_patterns))])
+
+        # ---- Pass 2: rebuild the body page by page (real page breaks, tables,
+        # inline images and column-aware reading order) ----
+        for page_index, page in enumerate(pdf):
+            if page_index > 0:
+                out_doc.add_page_break()
+
+            h = page.rect.height
+            page_x0, page_x1 = page.rect.x0, page.rect.x1
+
+            table_items = []
+            try:
+                for t in page.find_tables().tables:
+                    try:
+                        rows = t.extract()
+                    except Exception:
+                        continue
+                    if rows:
+                        table_items.append({"type": "table", "bbox": list(t.bbox), "rows": rows})
+            except Exception:
+                pass
+
+            image_items = []
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                try:
+                    rects = page.get_image_rects(xref) or []
+                except Exception:
+                    rects = []
+                if not rects:
+                    continue
+                try:
+                    pix = fitz.Pixmap(pdf, xref)
+                    if pix.n - pix.alpha >= 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    img_bytes = pix.tobytes("png")
+                except Exception:
+                    continue
+                for rect in rects:
+                    rbbox = [rect[0], rect[1], rect[2], rect[3]]
+                    if (rbbox[2] - rbbox[0]) < 5 or (rbbox[3] - rbbox[1]) < 5:
+                        continue
+                    if any(overlap_ratio(rbbox, t["bbox"]) > 0.5 for t in table_items):
+                        continue
+                    image_items.append({"type": "image", "bbox": rbbox, "data": img_bytes})
+
+            text_items = []
+            for b in page.get_text("dict")["blocks"]:
+                if b.get("type") != 0:
+                    continue
+                for l in b.get("lines", []):
+                    spans = l.get("spans", [])
+                    if not spans:
+                        continue
+                    bbox = l.get("bbox", [0, 0, 0, 0])
+                    raw_text = "".join(s.get("text", "") for s in spans).strip()
+                    if not raw_text:
+                        continue
+                    norm = re.sub(r'\d+', '#', raw_text)
+                    in_header_zone = bbox[3] < h * 0.10
+                    in_footer_zone = bbox[1] > h * 0.90
+                    if (in_header_zone and norm in header_patterns) or (in_footer_zone and norm in footer_patterns):
+                        continue
+                    if any(overlap_ratio(bbox, t["bbox"]) > 0.5 for t in table_items):
+                        continue
+
+                    run_params = []
+                    last_x = None
+                    first_span = spans[0]
+                    font_size = first_span.get("size", 11)
+
+                    for s in spans:
+                        text = s.get("text", "")
+                        sbbox = s.get("bbox", [0, 0, 0, 0])
+
+                        if last_x is not None:
+                            gap = sbbox[0] - last_x
+                            if gap > 2 and not text.startswith(" ") and not text.startswith(","):
+                                run_params.append({"text": " ", "size": font_size, "font": first_span.get("font", ""), "flags": 0})
+
+                        run_params.append({"text": text, "size": s.get("size", 11), "font": s.get("font", "").lower(), "flags": s.get("flags", 0)})
+                        last_x = sbbox[2]
+
+                    full_text = "".join(r["text"] for r in run_params).strip()
+                    if not full_text:
+                        continue
+                    text_items.append({"type": "text", "bbox": bbox, "runs": run_params, "full_text": full_text, "font_size": font_size})
+
+            content_width = max((it["bbox"][2] for it in (text_items + image_items)), default=page_x1) - page_x0
+            flowable = sorted(text_items + image_items + table_items, key=lambda it: (round(it["bbox"][1] / 5), it["bbox"][0]))
+
+            state = {"p": None, "last_y_bottom": -999, "last_font_size": -1}
+            band = []
+            for it in flowable:
+                is_break = it["type"] == "table" or (it["type"] == "image" and (it["bbox"][2] - it["bbox"][0]) >= 0.7 * max(content_width, 1))
+                if is_break:
+                    render_band(band, page_x0, page_x1, state)
+                    band = []
+                    (render_table if it["type"] == "table" else render_image)(it, state)
+                else:
+                    band.append(it)
+            render_band(band, page_x0, page_x1, state)
+
+        out_doc.save(docx_path)
+        
+    # 1. Primary conversion using pdf2docx (fast, good enough for most straightforward PDFs)
+    cv = Converter(temp_pdf_path)
+    cv.convert(temp_docx_path, start=0, end=None)
+    cv.close()
+
+    used_method = "layout-mode"
+    if has_spacing_issue(temp_docx_path):
+        if fix_glued_words_in_docx(temp_docx_path):
+            used_method = "layout-mode-corrected"
+        else:
+            convert_with_correct_spacing(temp_pdf_path, temp_docx_path)
+            used_method = "text-mode"
+    return used_method
+
+
 @app.post("/convert/pdf-to-word")
 async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     # Create temporary files for the input PDF and output DOCX
     fd_pdf, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
     fd_docx, temp_docx_path = tempfile.mkstemp(suffix=".docx")
-    
+
     os.close(fd_pdf)
     os.close(fd_docx)
 
     try:
-        # Write the uploaded file to the temp PDF path
-        with open(temp_pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        from pdf2docx import Converter
-        import docx
-        import fitz
-        
-        def has_spacing_issue(docx_path):
-            try:
-                doc = docx.Document(docx_path)
-                long_words = 0
-                total_words = 0
-                for para in doc.paragraphs:
-                    words = para.text.split()
-                    for w in words:
-                        total_words += 1
-                        if len(w) >= 15:
-                            long_words += 1
-                if total_words == 0: return False
-                return (long_words / total_words) > 0.05
-            except:
-                return False
-
-        def fix_glued_words_in_docx(docx_path):
-            # pdf2docx occasionally drops the space between words (common on
-            # Canva-exported PDFs, justified text, etc.), which has_spacing_issue()
-            # detects. Rather than throwing away pdf2docx's layout (tables, images,
-            # columns, fonts - all correct) and rebuilding the page from scratch,
-            # try a much cheaper surgical fix first: re-segment only the glued
-            # tokens in place with a dictionary-based word splitter, leaving every
-            # other run and all formatting untouched. Falls back to the full
-            # from-scratch rebuild only if this doesn't clear the issue.
-            import wordninja
-
-            def split_token(token):
-                if not token.isalpha() or len(token) < 15:
-                    return token
-                parts = wordninja.split(token)
-                if len(parts) <= 1 or ''.join(parts) != token:
-                    return token
-                return ' '.join(parts)
-
-            def fix_paragraphs(paragraphs):
-                for para in paragraphs:
-                    for run in para.runs:
-                        if not run.text:
-                            continue
-                        words = run.text.split(' ')
-                        fixed = [split_token(w) for w in words]
-                        if fixed != words:
-                            run.text = ' '.join(fixed)
-
-            try:
-                doc = docx.Document(docx_path)
-                fix_paragraphs(doc.paragraphs)
-                for table in doc.tables:
-                    for row in table.rows:
-                        for cell in row.cells:
-                            fix_paragraphs(cell.paragraphs)
-                doc.save(docx_path)
-                return not has_spacing_issue(docx_path)
-            except:
-                return False
-
-        def convert_with_correct_spacing(pdf_path, docx_path):
-            import re
-            from io import BytesIO
-            from collections import Counter
-            from docx.shared import Pt, Inches
-            from docx.oxml.ns import qn
-            from docx.oxml import OxmlElement
-
-            pdf = fitz.open(pdf_path)
-            out_doc = docx.Document()
-            section = out_doc.sections[0]
-            usable_width_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
-
-            def clean_font_name(f_str):
-                name = f_str.split('+')[-1]
-                name = re.sub(r'-(Bold|Italic|Regular|Medium|SemiBold|Light).*', '', name, flags=re.IGNORECASE)
-                name = re.sub(r'(MT|PSMT|MS|PS)$', '', name, flags=re.IGNORECASE)
-                name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
-                return name.strip()
-
-            def add_page_number_field(paragraph):
-                run = paragraph.add_run()
-                begin = OxmlElement('w:fldChar'); begin.set(qn('w:fldCharType'), 'begin')
-                instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve'); instr.text = "PAGE"
-                end = OxmlElement('w:fldChar'); end.set(qn('w:fldCharType'), 'end')
-                run._r.append(begin); run._r.append(instr); run._r.append(end)
-
-            def apply_field_text(paragraph, sample):
-                m = re.search(r'\d+', sample)
-                if not m:
-                    paragraph.add_run(sample)
-                    return
-                paragraph.add_run(sample[:m.start()])
-                add_page_number_field(paragraph)
-                paragraph.add_run(sample[m.end():])
-
-            def overlap_ratio(a, b):
-                ax0, ay0, ax1, ay1 = a
-                bx0, by0, bx1, by1 = b
-                ix0, iy0 = max(ax0, bx0), max(ay0, by0)
-                ix1, iy1 = min(ax1, bx1), min(ay1, by1)
-                if ix1 <= ix0 or iy1 <= iy0:
-                    return 0.0
-                inter = (ix1 - ix0) * (iy1 - iy0)
-                area_a = max(1.0, (ax1 - ax0) * (ay1 - ay0))
-                return inter / area_a
-
-            def detect_columns(items, page_x0, page_x1):
-                # Finds vertical whitespace gutters shared by most lines, so multi-column
-                # PDFs (magazines/papers) read top-to-bottom per column instead of
-                # interleaving alternating lines from the left and right columns.
-                page_width = page_x1 - page_x0
-                if page_width <= 0 or len(items) < 6:
-                    return [(page_x0, page_x1)]
-                bins = 80
-                bin_w = page_width / bins
-                covered = [False] * bins
-                for it in items:
-                    x0, x1 = it["bbox"][0], it["bbox"][2]
-                    b0 = max(0, int((x0 - page_x0) / bin_w))
-                    b1 = min(bins - 1, int((x1 - page_x0) / bin_w))
-                    for i in range(b0, b1 + 1):
-                        covered[i] = True
-                gaps = []
-                i = 0
-                while i < bins:
-                    if not covered[i]:
-                        j = i
-                        while j < bins and not covered[j]:
-                            j += 1
-                        gaps.append((page_x0 + i * bin_w, page_x0 + j * bin_w, i, j - 1))
-                        i = j
-                    else:
-                        i += 1
-                real_gaps = [g for g in gaps if (g[1] - g[0]) >= 12 and g[2] > 3 and g[3] < bins - 4]
-                if not real_gaps or len(real_gaps) > 2:
-                    return [(page_x0, page_x1)]
-                splits = sorted((g[0] + g[1]) / 2 for g in real_gaps)
-                bands, prev = [], page_x0
-                for s in splits:
-                    bands.append((prev, s))
-                    prev = s
-                bands.append((prev, page_x1))
-                counts = [sum(1 for it in items if bx0 <= (it["bbox"][0] + it["bbox"][2]) / 2 < bx1) for bx0, bx1 in bands]
-                total = sum(counts)
-                if total == 0 or min(counts) < max(2, total * 0.12):
-                    return [(page_x0, page_x1)]
-                return bands
-
-            def render_table(item, state):
-                rows = item["rows"]
-                max_cols = max(len(r) for r in rows)
-                table = out_doc.add_table(rows=len(rows), cols=max_cols)
-                table.style = "Table Grid"
-                for r_idx, row in enumerate(rows):
-                    for c_idx in range(max_cols):
-                        val = row[c_idx] if c_idx < len(row) and row[c_idx] is not None else ""
-                        table.cell(r_idx, c_idx).text = str(val).strip()
-                state["p"] = None
-                state["last_y_bottom"] = -999
-                state["last_font_size"] = -1
-
-            def render_image(item, state):
-                bbox = item["bbox"]
-                width_in = min((bbox[2] - bbox[0]) / 72.0, usable_width_in)
-                if width_in <= 0:
-                    width_in = usable_width_in
-                try:
-                    out_doc.add_picture(BytesIO(item["data"]), width=Inches(width_in))
-                except Exception:
-                    pass
-                state["p"] = None
-                state["last_y_bottom"] = -999
-                state["last_font_size"] = -1
-
-            def render_text(item, state):
-                bbox = item["bbox"]
-                y_top, y_bottom = bbox[1], bbox[3]
-                font_size = item["font_size"]
-                vertical_gap = y_top - state["last_y_bottom"]
-                is_bullet = item["full_text"].startswith(('•', '◦', '-', '*'))
-
-                start_new_para = True
-                if state["p"] is not None:
-                    if is_bullet:
-                        start_new_para = True
-                    elif y_top < (state["last_y_bottom"] - font_size * 0.3):
-                        start_new_para = True
-                    elif vertical_gap < (font_size * 0.5) and abs(font_size - state["last_font_size"]) < 1.0:
-                        start_new_para = False
-
-                if start_new_para:
-                    state["p"] = out_doc.add_paragraph()
-                else:
-                    state["p"].add_run(" ")
-
-                for r in item["runs"]:
-                    run = state["p"].add_run(r["text"])
-                    raw_font = r["font"]
-                    flags = r["flags"]
-                    if (flags & 16) or "bold" in raw_font or "black" in raw_font:
-                        run.bold = True
-                    if (flags & 2) or "italic" in raw_font:
-                        run.italic = True
-                    clean_name = clean_font_name(raw_font)
-                    if clean_name and clean_name.lower() != "unknown":
-                        run.font.name = clean_name
-                    if r["size"] > 0:
-                        run.font.size = Pt(round(r["size"]))
-
-                state["last_y_bottom"] = y_bottom
-                state["last_font_size"] = font_size
-
-            def render_band(band_items, page_x0, page_x1, state):
-                if not band_items:
-                    return
-                col_bands = detect_columns(band_items, page_x0, page_x1)
-                if len(col_bands) <= 1:
-                    ordered = sorted(band_items, key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
-                    for it in ordered:
-                        (render_image if it["type"] == "image" else render_text)(it, state)
-                    return
-                for bx0, bx1 in col_bands:
-                    col_items = [it for it in band_items if bx0 <= (it["bbox"][0] + it["bbox"][2]) / 2 < bx1]
-                    col_items.sort(key=lambda x: (round(x["bbox"][1] / 5), x["bbox"][0]))
-                    for it in col_items:
-                        (render_image if it["type"] == "image" else render_text)(it, state)
-
-            page_count = len(pdf)
-
-            # ---- Pass 1: detect header/footer lines that repeat across most pages, so
-            # they land in Word's real header/footer instead of the document body. ----
-            top_counter, bottom_counter = Counter(), Counter()
-            top_samples, bottom_samples = {}, {}
-            for page in pdf:
-                h = page.rect.height
-                for b in page.get_text("dict")["blocks"]:
-                    if b.get("type") != 0:
-                        continue
-                    for l in b.get("lines", []):
-                        txt = "".join(s.get("text", "") for s in l.get("spans", [])).strip()
-                        if not txt:
-                            continue
-                        y0, y1 = l["bbox"][1], l["bbox"][3]
-                        norm = re.sub(r'\d+', '#', txt)
-                        if y1 < h * 0.10:
-                            top_counter[norm] += 1
-                            top_samples.setdefault(norm, txt)
-                        elif y0 > h * 0.90:
-                            bottom_counter[norm] += 1
-                            bottom_samples.setdefault(norm, txt)
-
-            repeat_threshold = max(2, int(page_count * 0.6))
-            header_patterns = {p for p, c in top_counter.items() if c >= repeat_threshold} if page_count >= 3 else set()
-            footer_patterns = {p for p, c in bottom_counter.items() if c >= repeat_threshold} if page_count >= 3 else set()
-
-            if header_patterns:
-                apply_field_text(section.header.paragraphs[0], top_samples[next(iter(header_patterns))])
-            if footer_patterns:
-                apply_field_text(section.footer.paragraphs[0], bottom_samples[next(iter(footer_patterns))])
-
-            # ---- Pass 2: rebuild the body page by page (real page breaks, tables,
-            # inline images and column-aware reading order) ----
-            for page_index, page in enumerate(pdf):
-                if page_index > 0:
-                    out_doc.add_page_break()
-
-                h = page.rect.height
-                page_x0, page_x1 = page.rect.x0, page.rect.x1
-
-                table_items = []
-                try:
-                    for t in page.find_tables().tables:
-                        try:
-                            rows = t.extract()
-                        except Exception:
-                            continue
-                        if rows:
-                            table_items.append({"type": "table", "bbox": list(t.bbox), "rows": rows})
-                except Exception:
-                    pass
-
-                image_items = []
-                for img_info in page.get_images(full=True):
-                    xref = img_info[0]
-                    try:
-                        rects = page.get_image_rects(xref) or []
-                    except Exception:
-                        rects = []
-                    if not rects:
-                        continue
-                    try:
-                        pix = fitz.Pixmap(pdf, xref)
-                        if pix.n - pix.alpha >= 4:
-                            pix = fitz.Pixmap(fitz.csRGB, pix)
-                        img_bytes = pix.tobytes("png")
-                    except Exception:
-                        continue
-                    for rect in rects:
-                        rbbox = [rect[0], rect[1], rect[2], rect[3]]
-                        if (rbbox[2] - rbbox[0]) < 5 or (rbbox[3] - rbbox[1]) < 5:
-                            continue
-                        if any(overlap_ratio(rbbox, t["bbox"]) > 0.5 for t in table_items):
-                            continue
-                        image_items.append({"type": "image", "bbox": rbbox, "data": img_bytes})
-
-                text_items = []
-                for b in page.get_text("dict")["blocks"]:
-                    if b.get("type") != 0:
-                        continue
-                    for l in b.get("lines", []):
-                        spans = l.get("spans", [])
-                        if not spans:
-                            continue
-                        bbox = l.get("bbox", [0, 0, 0, 0])
-                        raw_text = "".join(s.get("text", "") for s in spans).strip()
-                        if not raw_text:
-                            continue
-                        norm = re.sub(r'\d+', '#', raw_text)
-                        in_header_zone = bbox[3] < h * 0.10
-                        in_footer_zone = bbox[1] > h * 0.90
-                        if (in_header_zone and norm in header_patterns) or (in_footer_zone and norm in footer_patterns):
-                            continue
-                        if any(overlap_ratio(bbox, t["bbox"]) > 0.5 for t in table_items):
-                            continue
-
-                        run_params = []
-                        last_x = None
-                        first_span = spans[0]
-                        font_size = first_span.get("size", 11)
-
-                        for s in spans:
-                            text = s.get("text", "")
-                            sbbox = s.get("bbox", [0, 0, 0, 0])
-
-                            if last_x is not None:
-                                gap = sbbox[0] - last_x
-                                if gap > 2 and not text.startswith(" ") and not text.startswith(","):
-                                    run_params.append({"text": " ", "size": font_size, "font": first_span.get("font", ""), "flags": 0})
-
-                            run_params.append({"text": text, "size": s.get("size", 11), "font": s.get("font", "").lower(), "flags": s.get("flags", 0)})
-                            last_x = sbbox[2]
-
-                        full_text = "".join(r["text"] for r in run_params).strip()
-                        if not full_text:
-                            continue
-                        text_items.append({"type": "text", "bbox": bbox, "runs": run_params, "full_text": full_text, "font_size": font_size})
-
-                content_width = max((it["bbox"][2] for it in (text_items + image_items)), default=page_x1) - page_x0
-                flowable = sorted(text_items + image_items + table_items, key=lambda it: (round(it["bbox"][1] / 5), it["bbox"][0]))
-
-                state = {"p": None, "last_y_bottom": -999, "last_font_size": -1}
-                band = []
-                for it in flowable:
-                    is_break = it["type"] == "table" or (it["type"] == "image" and (it["bbox"][2] - it["bbox"][0]) >= 0.7 * max(content_width, 1))
-                    if is_break:
-                        render_band(band, page_x0, page_x1, state)
-                        band = []
-                        (render_table if it["type"] == "table" else render_image)(it, state)
-                    else:
-                        band.append(it)
-                render_band(band, page_x0, page_x1, state)
-
-            out_doc.save(docx_path)
-        
-        # 1. Primary conversion using pdf2docx (fast, good enough for most straightforward PDFs)
-        cv = Converter(temp_pdf_path)
-        cv.convert(temp_docx_path, start=0, end=None)
-        cv.close()
-
-        used_method = "layout-mode"
-        if has_spacing_issue(temp_docx_path):
-            if fix_glued_words_in_docx(temp_docx_path):
-                used_method = "layout-mode-corrected"
-            else:
-                convert_with_correct_spacing(temp_pdf_path, temp_docx_path)
-                used_method = "text-mode"
+        used_method = await run_in_threadpool(_convert_pdf_to_word_sync, file.file, temp_pdf_path, temp_docx_path)
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_docx_path])
         return FileResponse(
-            path=temp_docx_path, 
-            filename=f"converted_{file.filename}.docx", 
+            path=temp_docx_path,
+            filename=f"converted_{file.filename}.docx",
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"X-Conversion-Method": used_method}
         )
@@ -598,6 +617,205 @@ def _pdf_cell_to_excel(raw):
     return num, None
 
 
+def _convert_pdf_to_excel_sync(file_obj, temp_pdf_path: str, temp_xlsx_path: str) -> None:
+    """All the blocking work for pdf-to-excel: writing the upload to disk and the
+    pdfplumber-based table extraction below (synchronous, CPU/IO-bound). Must be called
+    via run_in_threadpool - otherwise a large/complex PDF blocks every other request this
+    service is handling for however long extraction takes."""
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    import pdfplumber
+
+    wb = Workbook()
+    ws = wb.active
+    header_font = Font(bold=True)
+    max_col_widths = {}
+
+    def write_row(row_idx, values, bold=False):
+        for col_idx, raw in enumerate(values, start=1):
+            value, number_format = _pdf_cell_to_excel(raw)
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            if number_format:
+                cell.number_format = number_format
+            if bold:
+                cell.font = header_font
+            width = len(str(raw)) if raw is not None else 0
+            if width > max_col_widths.get(col_idx, 0):
+                max_col_widths[col_idx] = width
+
+    current_row = 1
+    prev_num_cols = None
+    prev_header = None
+
+    with pdfplumber.open(temp_pdf_path) as pdf:
+        for page in pdf.pages:
+            tables = [t for t in page.extract_tables() if t]
+
+            if not tables:
+                # Robust unruled / borderless table column-region extraction:
+                # Detects vertical column channels across the page by analyzing word coordinates,
+                # intra-phrase spacing, and alignments. Ensures that right-aligned numbers
+                # (e.g. Age: 32) and adjacent date columns (e.g. 15/10/2017) or names (First/Last)
+                # never merge into one cell.
+                extracted_rows = []
+                words = page.extract_words(x_tolerance=1, y_tolerance=1)
+                if words:
+                    lines = []
+                    current_line = []
+                    for w in sorted(words, key=lambda x: (x['top'], x['x0'])):
+                        if not current_line:
+                            current_line.append(w)
+                        else:
+                            if abs(w['top'] - current_line[0]['top']) <= 4.0:
+                                current_line.append(w)
+                            else:
+                                lines.append(sorted(current_line, key=lambda x: x['x0']))
+                                current_line = [w]
+                    if current_line:
+                        lines.append(sorted(current_line, key=lambda x: x['x0']))
+
+                    table_lines = []
+                    for line in lines:
+                        if len(line) == 1 and line[0]['text'] in ['Sheet1', 'Page']:
+                            continue
+                        if len(line) <= 2 and 'Page' in [w['text'] for w in line]:
+                            continue
+                        table_lines.append(line)
+
+                    if table_lines:
+                        line_phrases = []
+                        for line in table_lines:
+                            phrases = []
+                            cur_phrase = []
+                            for w in line:
+                                if not cur_phrase:
+                                    cur_phrase.append(w)
+                                else:
+                                    prev_w = cur_phrase[-1]
+                                    gap = w['x0'] - prev_w['x1']
+                                    if gap <= 3.2:
+                                        cur_phrase.append(w)
+                                    else:
+                                        phrases.append(cur_phrase)
+                                        cur_phrase = [w]
+                            if cur_phrase:
+                                phrases.append(cur_phrase)
+                            line_phrases.append(phrases)
+
+                        all_intervals = []
+                        for phrases in line_phrases:
+                            for p in phrases:
+                                all_intervals.append((p[0]['x0'], p[-1]['x1']))
+
+                        page_w = int(page.width) + 1
+                        coverage = [0] * page_w
+                        for x0, x1 in all_intervals:
+                            for x in range(max(0, int(x0 + 0.5)), min(page_w, int(x1 + 0.5))):
+                                coverage[x] += 1
+
+                        active_regions = []
+                        in_active = False
+                        reg_start = 0
+                        for x in range(page_w):
+                            if coverage[x] > 0 and not in_active:
+                                in_active = True
+                                reg_start = x
+                            elif coverage[x] == 0 and in_active:
+                                in_active = False
+                                active_regions.append([reg_start, x])
+                        if in_active:
+                            active_regions.append([reg_start, page_w])
+
+                        # Merge complementary sub-tracks (e.g. left-aligned header + right-aligned numbers)
+                        merged_regions = []
+                        i = 0
+                        while i < len(active_regions):
+                            cur_start, cur_end = active_regions[i]
+                            if i + 1 < len(active_regions):
+                                next_start, next_end = active_regions[i + 1]
+                                overlap = False
+                                for phrases in line_phrases:
+                                    has_cur = any(cur_start - 2 <= (p[0]['x0']+p[-1]['x1'])/2 <= cur_end + 2 for p in phrases)
+                                    has_next = any(next_start - 2 <= (p[0]['x0']+p[-1]['x1'])/2 <= next_end + 2 for p in phrases)
+                                    if has_cur and has_next:
+                                        overlap = True
+                                        break
+                                if not overlap and (next_end - cur_start) < 100:
+                                    merged_regions.append([cur_start, next_end])
+                                    i += 2
+                                    continue
+                            merged_regions.append([cur_start, cur_end])
+                            i += 1
+
+                        for phrases in line_phrases:
+                            row_cells = [[] for _ in merged_regions]
+                            for p in phrases:
+                                p_text = " ".join([w['text'] for w in p])
+                                p_mid = (p[0]['x0'] + p[-1]['x1']) / 2.0
+                                matched_idx = -1
+                                for idx, (t_start, t_end) in enumerate(merged_regions):
+                                    if t_start - 2 <= p_mid <= t_end + 2:
+                                        matched_idx = idx
+                                        break
+                                if matched_idx == -1:
+                                    distances = [abs(p_mid - (t_start + t_end)/2.0) for t_start, t_end in merged_regions]
+                                    matched_idx = distances.index(min(distances))
+                                row_cells[matched_idx].append(p_text)
+
+                            row = [" ".join(c) if c else "" for c in row_cells]
+                            while row and row[-1] == "":
+                                row.pop()
+                            if any(row):
+                                extracted_rows.append(row)
+
+                if extracted_rows:
+                    if prev_num_cols is not None:
+                        current_row += 1
+                    for i, row in enumerate(extracted_rows):
+                        is_header = (i == 0 and len(row) > 1)
+                        write_row(current_row, row, bold=is_header)
+                        current_row += 1
+                    prev_num_cols = len(extracted_rows[0]) if extracted_rows else None
+                    prev_header = None
+                continue
+
+            for table in tables:
+                raw_rows = [["" if c is None else str(c).strip() for c in row] for row in table]
+                num_cols = len(raw_rows[0]) if raw_rows else 0
+
+                # A table that resumes on the next page re-extracts with the same
+                # column count and a repeated header row - treat it as a continuation
+                # of the previous block (no blank separator, no duplicate header)
+                # rather than a brand-new table.
+                is_continuation = (
+                    prev_num_cols == num_cols
+                    and prev_header is not None
+                    and raw_rows
+                    and raw_rows[0] == prev_header
+                )
+
+                rows_to_write = raw_rows[1:] if is_continuation else raw_rows
+                if not is_continuation and prev_num_cols is not None:
+                    current_row += 1  # blank row between genuinely distinct tables
+
+                for i, row in enumerate(rows_to_write):
+                    is_header_row = not is_continuation and i == 0
+                    write_row(current_row, row, bold=is_header_row)
+                    current_row += 1
+
+                prev_num_cols = num_cols
+                prev_header = raw_rows[0] if raw_rows else None
+
+    for col_idx, width in max_col_widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width + 2, 8), 60)
+
+    wb.save(temp_xlsx_path)
+
+
 @app.post("/convert/pdf-to-excel")
 async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fd_pdf, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
@@ -607,198 +825,7 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
     os.close(fd_xlsx)
 
     try:
-        with open(temp_pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        from openpyxl import Workbook
-        from openpyxl.styles import Font
-        from openpyxl.utils import get_column_letter
-        import pdfplumber
-
-        wb = Workbook()
-        ws = wb.active
-        header_font = Font(bold=True)
-        max_col_widths = {}
-
-        def write_row(row_idx, values, bold=False):
-            for col_idx, raw in enumerate(values, start=1):
-                value, number_format = _pdf_cell_to_excel(raw)
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                if number_format:
-                    cell.number_format = number_format
-                if bold:
-                    cell.font = header_font
-                width = len(str(raw)) if raw is not None else 0
-                if width > max_col_widths.get(col_idx, 0):
-                    max_col_widths[col_idx] = width
-
-        current_row = 1
-        prev_num_cols = None
-        prev_header = None
-
-        with pdfplumber.open(temp_pdf_path) as pdf:
-            for page in pdf.pages:
-                tables = [t for t in page.extract_tables() if t]
-
-                if not tables:
-                    # Robust unruled / borderless table column-region extraction:
-                    # Detects vertical column channels across the page by analyzing word coordinates,
-                    # intra-phrase spacing, and alignments. Ensures that right-aligned numbers
-                    # (e.g. Age: 32) and adjacent date columns (e.g. 15/10/2017) or names (First/Last)
-                    # never merge into one cell.
-                    extracted_rows = []
-                    words = page.extract_words(x_tolerance=1, y_tolerance=1)
-                    if words:
-                        lines = []
-                        current_line = []
-                        for w in sorted(words, key=lambda x: (x['top'], x['x0'])):
-                            if not current_line:
-                                current_line.append(w)
-                            else:
-                                if abs(w['top'] - current_line[0]['top']) <= 4.0:
-                                    current_line.append(w)
-                                else:
-                                    lines.append(sorted(current_line, key=lambda x: x['x0']))
-                                    current_line = [w]
-                        if current_line:
-                            lines.append(sorted(current_line, key=lambda x: x['x0']))
-
-                        table_lines = []
-                        for line in lines:
-                            if len(line) == 1 and line[0]['text'] in ['Sheet1', 'Page']:
-                                continue
-                            if len(line) <= 2 and 'Page' in [w['text'] for w in line]:
-                                continue
-                            table_lines.append(line)
-
-                        if table_lines:
-                            line_phrases = []
-                            for line in table_lines:
-                                phrases = []
-                                cur_phrase = []
-                                for w in line:
-                                    if not cur_phrase:
-                                        cur_phrase.append(w)
-                                    else:
-                                        prev_w = cur_phrase[-1]
-                                        gap = w['x0'] - prev_w['x1']
-                                        if gap <= 3.2:
-                                            cur_phrase.append(w)
-                                        else:
-                                            phrases.append(cur_phrase)
-                                            cur_phrase = [w]
-                                if cur_phrase:
-                                    phrases.append(cur_phrase)
-                                line_phrases.append(phrases)
-
-                            all_intervals = []
-                            for phrases in line_phrases:
-                                for p in phrases:
-                                    all_intervals.append((p[0]['x0'], p[-1]['x1']))
-
-                            page_w = int(page.width) + 1
-                            coverage = [0] * page_w
-                            for x0, x1 in all_intervals:
-                                for x in range(max(0, int(x0 + 0.5)), min(page_w, int(x1 + 0.5))):
-                                    coverage[x] += 1
-
-                            active_regions = []
-                            in_active = False
-                            reg_start = 0
-                            for x in range(page_w):
-                                if coverage[x] > 0 and not in_active:
-                                    in_active = True
-                                    reg_start = x
-                                elif coverage[x] == 0 and in_active:
-                                    in_active = False
-                                    active_regions.append([reg_start, x])
-                            if in_active:
-                                active_regions.append([reg_start, page_w])
-
-                            # Merge complementary sub-tracks (e.g. left-aligned header + right-aligned numbers)
-                            merged_regions = []
-                            i = 0
-                            while i < len(active_regions):
-                                cur_start, cur_end = active_regions[i]
-                                if i + 1 < len(active_regions):
-                                    next_start, next_end = active_regions[i + 1]
-                                    overlap = False
-                                    for phrases in line_phrases:
-                                        has_cur = any(cur_start - 2 <= (p[0]['x0']+p[-1]['x1'])/2 <= cur_end + 2 for p in phrases)
-                                        has_next = any(next_start - 2 <= (p[0]['x0']+p[-1]['x1'])/2 <= next_end + 2 for p in phrases)
-                                        if has_cur and has_next:
-                                            overlap = True
-                                            break
-                                    if not overlap and (next_end - cur_start) < 100:
-                                        merged_regions.append([cur_start, next_end])
-                                        i += 2
-                                        continue
-                                merged_regions.append([cur_start, cur_end])
-                                i += 1
-
-                            for phrases in line_phrases:
-                                row_cells = [[] for _ in merged_regions]
-                                for p in phrases:
-                                    p_text = " ".join([w['text'] for w in p])
-                                    p_mid = (p[0]['x0'] + p[-1]['x1']) / 2.0
-                                    matched_idx = -1
-                                    for idx, (t_start, t_end) in enumerate(merged_regions):
-                                        if t_start - 2 <= p_mid <= t_end + 2:
-                                            matched_idx = idx
-                                            break
-                                    if matched_idx == -1:
-                                        distances = [abs(p_mid - (t_start + t_end)/2.0) for t_start, t_end in merged_regions]
-                                        matched_idx = distances.index(min(distances))
-                                    row_cells[matched_idx].append(p_text)
-
-                                row = [" ".join(c) if c else "" for c in row_cells]
-                                while row and row[-1] == "":
-                                    row.pop()
-                                if any(row):
-                                    extracted_rows.append(row)
-
-                    if extracted_rows:
-                        if prev_num_cols is not None:
-                            current_row += 1
-                        for i, row in enumerate(extracted_rows):
-                            is_header = (i == 0 and len(row) > 1)
-                            write_row(current_row, row, bold=is_header)
-                            current_row += 1
-                        prev_num_cols = len(extracted_rows[0]) if extracted_rows else None
-                        prev_header = None
-                    continue
-
-                for table in tables:
-                    raw_rows = [["" if c is None else str(c).strip() for c in row] for row in table]
-                    num_cols = len(raw_rows[0]) if raw_rows else 0
-
-                    # A table that resumes on the next page re-extracts with the same
-                    # column count and a repeated header row - treat it as a continuation
-                    # of the previous block (no blank separator, no duplicate header)
-                    # rather than a brand-new table.
-                    is_continuation = (
-                        prev_num_cols == num_cols
-                        and prev_header is not None
-                        and raw_rows
-                        and raw_rows[0] == prev_header
-                    )
-
-                    rows_to_write = raw_rows[1:] if is_continuation else raw_rows
-                    if not is_continuation and prev_num_cols is not None:
-                        current_row += 1  # blank row between genuinely distinct tables
-
-                    for i, row in enumerate(rows_to_write):
-                        is_header_row = not is_continuation and i == 0
-                        write_row(current_row, row, bold=is_header_row)
-                        current_row += 1
-
-                    prev_num_cols = num_cols
-                    prev_header = raw_rows[0] if raw_rows else None
-
-        for col_idx, width in max_col_widths.items():
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width + 2, 8), 60)
-
-        wb.save(temp_xlsx_path)
+        await run_in_threadpool(_convert_pdf_to_excel_sync, file.file, temp_pdf_path, temp_xlsx_path)
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_xlsx_path])
         return FileResponse(path=temp_xlsx_path, filename=f"converted_{file.filename}.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -806,44 +833,52 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
         remove_files([temp_pdf_path, temp_xlsx_path])
         raise HTTPException(status_code=500, detail=str(e))
 
+def _convert_pdf_to_ppt_sync(file_obj, temp_pdf_path: str, temp_pptx_path: str) -> None:
+    """All the blocking work for pdf-to-ppt: writing the upload to disk and rendering each
+    page to an image (PyMuPDF, synchronous/CPU-bound). Must be called via run_in_threadpool -
+    otherwise a large/multi-page PDF blocks every other request this service is handling for
+    however long rendering takes."""
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    doc = fitz.open(temp_pdf_path)
+    prs = Presentation()
+    from pptx.util import Pt
+
+    if len(doc) > 0:
+        # Set slide size to match the first PDF page
+        prs.slide_width = Pt(doc[0].rect.width)
+        prs.slide_height = Pt(doc[0].rect.height)
+
+    blank_slide_layout = prs.slide_layouts[6] # blank layout
+
+    for page in doc:
+        pix = page.get_pixmap(dpi=150)
+        img_data = pix.tobytes("png")
+
+        fd_img, temp_img_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd_img)
+        with open(temp_img_path, "wb") as f:
+            f.write(img_data)
+
+        slide = prs.slides.add_slide(blank_slide_layout)
+        slide.shapes.add_picture(temp_img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
+
+        os.remove(temp_img_path)
+
+    prs.save(temp_pptx_path)
+
+
 @app.post("/convert/pdf-to-ppt")
 async def convert_pdf_to_ppt(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fd_pdf, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
     fd_pptx, temp_pptx_path = tempfile.mkstemp(suffix=".pptx")
-    
+
     os.close(fd_pdf)
     os.close(fd_pptx)
 
     try:
-        with open(temp_pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        doc = fitz.open(temp_pdf_path)
-        prs = Presentation()
-        from pptx.util import Pt
-        
-        if len(doc) > 0:
-            # Set slide size to match the first PDF page
-            prs.slide_width = Pt(doc[0].rect.width)
-            prs.slide_height = Pt(doc[0].rect.height)
-            
-        blank_slide_layout = prs.slide_layouts[6] # blank layout
-        
-        for page in doc:
-            pix = page.get_pixmap(dpi=150)
-            img_data = pix.tobytes("png")
-            
-            fd_img, temp_img_path = tempfile.mkstemp(suffix=".png")
-            os.close(fd_img)
-            with open(temp_img_path, "wb") as f:
-                f.write(img_data)
-                
-            slide = prs.slides.add_slide(blank_slide_layout)
-            slide.shapes.add_picture(temp_img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
-            
-            os.remove(temp_img_path)
-            
-        prs.save(temp_pptx_path)
+        await run_in_threadpool(_convert_pdf_to_ppt_sync, file.file, temp_pdf_path, temp_pptx_path)
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_pptx_path])
         return FileResponse(path=temp_pptx_path, filename=f"converted_{file.filename}.pptx", media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
@@ -851,26 +886,34 @@ async def convert_pdf_to_ppt(background_tasks: BackgroundTasks, file: UploadFile
         remove_files([temp_pdf_path, temp_pptx_path])
         raise HTTPException(status_code=500, detail=str(e))
 
+def _convert_pdf_to_images_sync(file_obj, temp_pdf_path: str, temp_zip_path: str) -> None:
+    """All the blocking work for pdf-to-images: writing the upload to disk and rendering each
+    page to a JPEG (PyMuPDF, synchronous/CPU-bound). Must be called via run_in_threadpool -
+    otherwise a large/multi-page PDF blocks every other request this service is handling for
+    however long rendering takes."""
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    doc = fitz.open(temp_pdf_path)
+
+    with zipfile.ZipFile(temp_zip_path, 'w') as zipf:
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(dpi=150)
+            img_data = pix.tobytes("jpeg")
+            zipf.writestr(f"page_{i+1}.jpg", img_data)
+
+
 @app.post("/convert/pdf-to-images")
 async def convert_pdf_to_images(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fd_pdf, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
     fd_zip, temp_zip_path = tempfile.mkstemp(suffix=".zip")
-    
+
     os.close(fd_pdf)
     os.close(fd_zip)
 
     try:
-        with open(temp_pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        doc = fitz.open(temp_pdf_path)
-        
-        with zipfile.ZipFile(temp_zip_path, 'w') as zipf:
-            for i, page in enumerate(doc):
-                pix = page.get_pixmap(dpi=150)
-                img_data = pix.tobytes("jpeg")
-                zipf.writestr(f"page_{i+1}.jpg", img_data)
-                
+        await run_in_threadpool(_convert_pdf_to_images_sync, file.file, temp_pdf_path, temp_zip_path)
+
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_zip_path])
         return FileResponse(path=temp_zip_path, filename=f"converted_images.zip", media_type="application/zip")
     except Exception as e:
@@ -962,6 +1005,37 @@ async def convert_ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile
     return await office_to_pdf_response(background_tasks, file)
 
 
+def _compress_pdf_sync(file_obj, input_path: str, output_path: str, pdf_settings: str) -> tuple[int, int]:
+    """All the blocking work for compress-pdf: writing the upload to disk and running
+    Ghostscript. Must be called via run_in_threadpool - Ghostscript can take up to its 100s
+    subprocess timeout, and calling it directly on the event loop would freeze every other
+    request this service is handling for that entire duration."""
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+    before_size = os.path.getsize(input_path)
+
+    result = subprocess.run(
+        [
+            GHOSTSCRIPT_BIN,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={pdf_settings}",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            input_path,
+        ],
+        capture_output=True,
+        timeout=100,
+    )
+    if result.returncode != 0 or not os.path.exists(output_path):
+        stderr = result.stderr.decode(errors="ignore") if result.stderr else "unknown error"
+        raise RuntimeError(f"Ghostscript compression failed: {stderr}")
+    after_size = os.path.getsize(output_path)
+    return before_size, after_size
+
+
 @app.post("/convert/compress-pdf")
 async def convert_compress_pdf(
     background_tasks: BackgroundTasks, file: UploadFile = File(...), level: str = Form("recommended")
@@ -972,29 +1046,7 @@ async def convert_compress_pdf(
     output_path = os.path.join(work_dir, "output.pdf")
 
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        before_size = os.path.getsize(input_path)
-
-        result = subprocess.run(
-            [
-                GHOSTSCRIPT_BIN,
-                "-sDEVICE=pdfwrite",
-                "-dCompatibilityLevel=1.4",
-                f"-dPDFSETTINGS={pdf_settings}",
-                "-dNOPAUSE",
-                "-dQUIET",
-                "-dBATCH",
-                f"-sOutputFile={output_path}",
-                input_path,
-            ],
-            capture_output=True,
-            timeout=100,
-        )
-        if result.returncode != 0 or not os.path.exists(output_path):
-            stderr = result.stderr.decode(errors="ignore") if result.stderr else "unknown error"
-            raise RuntimeError(f"Ghostscript compression failed: {stderr}")
-        after_size = os.path.getsize(output_path)
+        before_size, after_size = await run_in_threadpool(_compress_pdf_sync, file.file, input_path, output_path, pdf_settings)
 
         background_tasks.add_task(shutil.rmtree, work_dir, True)
         return FileResponse(
@@ -1008,6 +1060,20 @@ async def convert_compress_pdf(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _pdf_thumbnail_sync(file_obj, temp_pdf_path: str, temp_png_path: str) -> None:
+    """The blocking work for pdf-thumbnail (writing the upload to disk and rendering page 1
+    via PyMuPDF). Cheap per-call, but still run via run_in_threadpool for consistency with
+    every other endpoint here, and so a burst of thumbnail requests can't add up to a
+    noticeable stall on the event loop."""
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    doc = fitz.open(temp_pdf_path)
+    if len(doc) == 0:
+        raise RuntimeError("PDF has no pages")
+    doc[0].get_pixmap(dpi=72).save(temp_png_path)
+
+
 @app.post("/convert/pdf-thumbnail")
 async def convert_pdf_thumbnail(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     fd_pdf, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
@@ -1016,19 +1082,31 @@ async def convert_pdf_thumbnail(background_tasks: BackgroundTasks, file: UploadF
     os.close(fd_png)
 
     try:
-        with open(temp_pdf_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        doc = fitz.open(temp_pdf_path)
-        if len(doc) == 0:
-            raise RuntimeError("PDF has no pages")
-        doc[0].get_pixmap(dpi=72).save(temp_png_path)
+        await run_in_threadpool(_pdf_thumbnail_sync, file.file, temp_pdf_path, temp_png_path)
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_png_path])
         return FileResponse(path=temp_png_path, media_type="image/png")
     except Exception as e:
         remove_files([temp_pdf_path, temp_png_path])
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _office_thumbnail_sync(file_obj, input_path: str, work_dir: str) -> str:
+    """All the blocking work for office-thumbnail: writing the upload to disk, converting it
+    to PDF via LibreOffice, then rendering page 1. Must be called via run_in_threadpool -
+    LibreOffice alone can take up to its 100s subprocess timeout, and calling it directly on
+    the event loop would freeze every other request this service is handling for that
+    entire duration."""
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    pdf_path = convert_with_soffice(input_path, work_dir)
+    doc = fitz.open(pdf_path)
+    if len(doc) == 0:
+        raise RuntimeError("Converted document has no pages")
+    png_path = os.path.join(work_dir, "thumb.png")
+    doc[0].get_pixmap(dpi=72).save(png_path)
+    return png_path
 
 
 @app.post("/convert/office-thumbnail")
@@ -1038,15 +1116,7 @@ async def convert_office_thumbnail(background_tasks: BackgroundTasks, file: Uplo
     input_path = os.path.join(work_dir, f"input{ext}")
 
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        pdf_path = convert_with_soffice(input_path, work_dir)
-        doc = fitz.open(pdf_path)
-        if len(doc) == 0:
-            raise RuntimeError("Converted document has no pages")
-        png_path = os.path.join(work_dir, "thumb.png")
-        doc[0].get_pixmap(dpi=72).save(png_path)
+        png_path = await run_in_threadpool(_office_thumbnail_sync, file.file, input_path, work_dir)
 
         background_tasks.add_task(shutil.rmtree, work_dir, True)
         return FileResponse(path=png_path, media_type="image/png")
