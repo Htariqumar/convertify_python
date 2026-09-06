@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.concurrency import run_in_threadpool
 from pdf2docx import Converter
 import pdfplumber
 from openpyxl import Workbook
@@ -8,11 +9,12 @@ import fitz # PyMuPDF
 import tempfile
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import zipfile
 import edge_tts
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import imageio_ffmpeg
 
 # LibreOffice (word/excel/ppt <-> pdf) and Ghostscript (compress-pdf, thumbnails) run here
@@ -31,11 +33,38 @@ import faster_whisper
 whisper_model = faster_whisper.WhisperModel("base", device="cpu", compute_type="int8")
 
 class TTSRequest(BaseModel):
-    text: str
+    # Mirrors the 5000-char cap enforced client-side (TextToSpeechZone.tsx) and
+    # server-side (the Next.js route) - kept here too so a request that reaches
+    # this service directly can't force an oversized edge-tts synthesis job.
+    text: str = Field(..., max_length=5000)
     voice: str = "en-US-JennyNeural"
     speed: str = "+0%"
 
 app = FastAPI(title="Convertify Python Microservice")
+
+# Shared secret with the Next.js app (lib/pythonService.ts) so /convert/* can't be
+# hit for free by anyone who can route to this service directly, bypassing the
+# rate limiting that otherwise only runs in the Next.js route handlers. Optional -
+# if unset, the check is skipped so local dev doesn't need it configured - but the
+# Next.js side must be given the same value once this is exposed publicly.
+PYTHON_SERVICE_SECRET = os.environ.get("PYTHON_SERVICE_SECRET")
+if not PYTHON_SERVICE_SECRET:
+    print(
+        "[startup] WARNING: PYTHON_SERVICE_SECRET is not set - /convert/* endpoints "
+        "are reachable by anyone who can route to this service. Set it here and as "
+        "PYTHON_SERVICE_SECRET in the Next.js app before exposing this service publicly."
+    )
+
+
+@app.middleware("http")
+async def verify_internal_secret(request: Request, call_next):
+    if PYTHON_SERVICE_SECRET and request.url.path.startswith("/convert/"):
+        expected = f"Bearer {PYTHON_SERVICE_SECRET}"
+        provided = request.headers.get("authorization", "")
+        if not secrets.compare_digest(provided, expected):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
 
 @app.get("/")
 def read_root():
@@ -871,10 +900,25 @@ async def convert_text_to_speech(background_tasks: BackgroundTasks, request: TTS
         # saves the error message as if it were a working MP3.
         raise HTTPException(status_code=500, detail=str(e))
 
+def _run_whisper_transcription(audio_path: str, transcribe_kwargs: dict) -> tuple[str, str]:
+    """Runs the actual (CPU-bound, synchronous) faster-whisper inference. Must be
+    called via run_in_threadpool - transcribe() returns a lazily-evaluated generator,
+    so the real work happens while iterating segments below, not in the transcribe()
+    call itself. Called directly on the event loop this would block every other
+    request the service is handling (TTS, PDF conversions, other users' STT) for the
+    entire duration of the transcription."""
+    segments, info = whisper_model.transcribe(audio_path, **transcribe_kwargs)
+    full_text = ""
+    for segment in segments:
+        full_text += segment.text + " "
+    return full_text.strip(), info.language
+
+
 @app.post("/convert/speech-to-text")
 async def convert_speech_to_text(file: UploadFile = File(...), language: str = Form(None)):
     # Save the uploaded file temporarily
-    fd_audio, temp_audio_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename)[1])
+    suffix = os.path.splitext(file.filename or "")[1]
+    fd_audio, temp_audio_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd_audio)
 
     try:
@@ -889,14 +933,11 @@ async def convert_speech_to_text(file: UploadFile = File(...), language: str = F
         if language:
             transcribe_kwargs["language"] = language
 
-        segments, info = whisper_model.transcribe(temp_audio_path, **transcribe_kwargs)
+        full_text, detected_language = await run_in_threadpool(
+            _run_whisper_transcription, temp_audio_path, transcribe_kwargs
+        )
 
-        # Combine segments into full text
-        full_text = ""
-        for segment in segments:
-            full_text += segment.text + " "
-
-        return {"text": full_text.strip(), "language": info.language}
+        return {"text": full_text, "language": detected_language}
     except Exception as e:
         return {"error": str(e)}
     finally:

@@ -19,6 +19,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PORT=8001
+# Each worker is a separate process that loads its own copy of the Whisper model into
+# RAM, so raising this multiplies memory use accordingly - only increase it once the
+# host has RAM to spare (see DEPLOYMENT.md). Default of 1 is safe for small hosts and
+# still handles concurrent requests fine (see run_in_threadpool usage in main.py) -
+# this just adds true multi-process parallelism for when traffic grows.
+ENV UVICORN_WORKERS=1
 EXPOSE 8001
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS}"]
