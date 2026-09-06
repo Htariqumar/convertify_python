@@ -834,37 +834,222 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
         raise HTTPException(status_code=500, detail=str(e))
 
 def _convert_pdf_to_ppt_sync(file_obj, temp_pdf_path: str, temp_pptx_path: str) -> None:
-    """All the blocking work for pdf-to-ppt: writing the upload to disk and rendering each
-    page to an image (PyMuPDF, synchronous/CPU-bound). Must be called via run_in_threadpool -
-    otherwise a large/multi-page PDF blocks every other request this service is handling for
-    however long rendering takes."""
+    """All the blocking work for pdf-to-ppt: writing the upload to disk and rebuilding each
+    page as real, editable PowerPoint content (text boxes, native tables, and images placed
+    at their original PDF positions) rather than a flat screenshot. Synchronous/CPU-bound -
+    must be called via run_in_threadpool, otherwise a large/multi-page PDF blocks every other
+    request this service is handling for however long rebuilding takes.
+
+    Each page is reconstructed independently (unlike the pdf-to-word text-mode path, a slide
+    is an absolute canvas, so there's no paragraph-flow/column-reading-order to work out -
+    every element is just placed at its own bbox). PPTX requires one slide size for the whole
+    deck, so pages smaller than the largest page are centered on it instead of stretched - a
+    page is never resized to fit, so nothing on it is ever distorted. A page whose content is
+    pure vector art (no extractable text or raster images - e.g. some diagrams/illustrations)
+    falls back to a full-page screenshot of just that page, so no slide ever ends up blank."""
+    from io import BytesIO
+    from pptx.util import Pt
+    from pptx.enum.text import MSO_AUTO_SIZE
+    from pptx.dml.color import RGBColor
+
     with open(temp_pdf_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
 
     doc = fitz.open(temp_pdf_path)
     prs = Presentation()
-    from pptx.util import Pt
-
-    if len(doc) > 0:
-        # Set slide size to match the first PDF page
-        prs.slide_width = Pt(doc[0].rect.width)
-        prs.slide_height = Pt(doc[0].rect.height)
-
     blank_slide_layout = prs.slide_layouts[6] # blank layout
 
-    for page in doc:
+    if len(doc) == 0:
+        prs.save(temp_pptx_path)
+        return
+
+    def clean_font_name(f_str):
+        name = (f_str or "").split('+')[-1]
+        name = re.sub(r'-(Bold|Italic|Regular|Medium|SemiBold|Light).*', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'(MT|PSMT|MS|PS)$', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+        return name.strip()
+
+    def overlap_ratio(a, b):
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return 0.0
+        inter = (ix1 - ix0) * (iy1 - iy0)
+        area_a = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+        return inter / area_a
+
+    def add_table(slide, item, offset_x, offset_y):
+        bx0, by0, bx1, by1 = item["bbox"]
+        rows = item["rows"]
+        num_cols = max((len(r) for r in rows), default=0)
+        if not rows or num_cols == 0:
+            return
+        width = max(bx1 - bx0, 10)
+        height = max(by1 - by0, 10 * len(rows))
+        graphic_frame = slide.shapes.add_table(
+            len(rows), num_cols, Pt(bx0 + offset_x), Pt(by0 + offset_y), Pt(width), Pt(height)
+        )
+        table = graphic_frame.table
+        for r_idx, row in enumerate(rows):
+            for c_idx in range(num_cols):
+                val = row[c_idx] if c_idx < len(row) and row[c_idx] is not None else ""
+                table.cell(r_idx, c_idx).text = str(val).strip()
+
+    def add_image(slide, item, offset_x, offset_y):
+        bx0, by0, bx1, by1 = item["bbox"]
+        width = max(bx1 - bx0, 1)
+        height = max(by1 - by0, 1)
+        try:
+            slide.shapes.add_picture(
+                BytesIO(item["data"]), Pt(bx0 + offset_x), Pt(by0 + offset_y), width=Pt(width), height=Pt(height)
+            )
+        except Exception:
+            pass
+
+    def add_text_line(slide, item, offset_x, offset_y):
+        bx0, by0, bx1, by1 = item["bbox"]
+        font_size = item["font_size"]
+        box_width = max(bx1 - bx0, 1) + 4 # small margin so a run is never forced to wrap
+        box_height = max(by1 - by0, font_size * 1.3)
+
+        textbox = slide.shapes.add_textbox(Pt(bx0 + offset_x), Pt(by0 + offset_y), Pt(box_width), Pt(box_height))
+        tf = textbox.text_frame
+        tf.word_wrap = False
+        tf.auto_size = MSO_AUTO_SIZE.NONE
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+        paragraph = tf.paragraphs[0]
+
+        for r in item["runs"]:
+            run = paragraph.add_run()
+            run.text = r["text"]
+            if r["size"] > 0:
+                run.font.size = Pt(round(r["size"]))
+            raw_font = r["font"]
+            flags = r["flags"]
+            if (flags & 16) or "bold" in raw_font or "black" in raw_font:
+                run.font.bold = True
+            if (flags & 2) or "italic" in raw_font:
+                run.font.italic = True
+            clean_name = clean_font_name(r["font"])
+            if clean_name and clean_name.lower() != "unknown":
+                run.font.name = clean_name
+            color = r.get("color")
+            if isinstance(color, int):
+                try:
+                    run.font.color.rgb = RGBColor((color >> 16) & 255, (color >> 8) & 255, color & 255)
+                except Exception:
+                    pass
+
+    def add_fallback_screenshot(slide, page, offset_x, offset_y, page_w, page_h):
+        # Safety net for pages with no extractable text/images (pure vector art, e.g. some
+        # diagrams) - without this, such a page would render as a silently blank slide.
         pix = page.get_pixmap(dpi=150)
         img_data = pix.tobytes("png")
+        try:
+            slide.shapes.add_picture(BytesIO(img_data), Pt(offset_x), Pt(offset_y), width=Pt(page_w), height=Pt(page_h))
+        except Exception:
+            pass
 
-        fd_img, temp_img_path = tempfile.mkstemp(suffix=".png")
-        os.close(fd_img)
-        with open(temp_img_path, "wb") as f:
-            f.write(img_data)
+    # PPTX requires one slide size for the whole deck - use the largest page in each
+    # dimension so no page's content is ever scaled down, then center every page on it.
+    max_w = max(page.rect.width for page in doc)
+    max_h = max(page.rect.height for page in doc)
+    prs.slide_width = Pt(max_w)
+    prs.slide_height = Pt(max_h)
 
+    for page in doc:
         slide = prs.slides.add_slide(blank_slide_layout)
-        slide.shapes.add_picture(temp_img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
+        page_w, page_h = page.rect.width, page.rect.height
+        offset_x = (max_w - page_w) / 2.0
+        offset_y = (max_h - page_h) / 2.0
 
-        os.remove(temp_img_path)
+        table_items = []
+        try:
+            for t in page.find_tables().tables:
+                try:
+                    rows = t.extract()
+                except Exception:
+                    continue
+                if rows:
+                    table_items.append({"bbox": list(t.bbox), "rows": rows})
+        except Exception:
+            pass
+
+        image_items = []
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            try:
+                rects = page.get_image_rects(xref) or []
+            except Exception:
+                rects = []
+            if not rects:
+                continue
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.n - pix.alpha >= 4:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                img_bytes = pix.tobytes("png")
+            except Exception:
+                continue
+            for rect in rects:
+                rbbox = [rect[0], rect[1], rect[2], rect[3]]
+                if (rbbox[2] - rbbox[0]) < 2 or (rbbox[3] - rbbox[1]) < 2:
+                    continue
+                if any(overlap_ratio(rbbox, t["bbox"]) > 0.5 for t in table_items):
+                    continue
+                image_items.append({"bbox": rbbox, "data": img_bytes})
+
+        text_items = []
+        for b in page.get_text("dict")["blocks"]:
+            if b.get("type") != 0:
+                continue
+            for l in b.get("lines", []):
+                spans = l.get("spans", [])
+                if not spans:
+                    continue
+                bbox = l.get("bbox", [0, 0, 0, 0])
+                raw_text = "".join(s.get("text", "") for s in spans).strip()
+                if not raw_text:
+                    continue
+                if any(overlap_ratio(bbox, t["bbox"]) > 0.5 for t in table_items):
+                    continue
+
+                run_params = []
+                last_x = None
+                first_span = spans[0]
+                font_size = first_span.get("size", 11) or 11
+
+                for s in spans:
+                    text = s.get("text", "")
+                    sbbox = s.get("bbox", [0, 0, 0, 0])
+                    if last_x is not None:
+                        gap = sbbox[0] - last_x
+                        if gap > 2 and not text.startswith(" ") and not text.startswith(","):
+                            run_params.append({"text": " ", "size": font_size, "font": first_span.get("font", ""), "flags": 0, "color": first_span.get("color")})
+                    run_params.append({
+                        "text": text,
+                        "size": s.get("size", 11) or 11,
+                        "font": (s.get("font") or "").lower(),
+                        "flags": s.get("flags", 0),
+                        "color": s.get("color"),
+                    })
+                    last_x = sbbox[2]
+
+                text_items.append({"bbox": bbox, "runs": run_params, "font_size": font_size})
+
+        if not table_items and not image_items and not text_items:
+            add_fallback_screenshot(slide, page, offset_x, offset_y, page_w, page_h)
+            continue
+
+        for t in table_items:
+            add_table(slide, t, offset_x, offset_y)
+        for img in image_items:
+            add_image(slide, img, offset_x, offset_y)
+        for line in text_items:
+            add_text_line(slide, line, offset_x, offset_y)
 
     prs.save(temp_pptx_path)
 
