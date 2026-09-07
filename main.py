@@ -30,6 +30,16 @@ from unoserver.client import UnoClient
 SOFFICE_BIN = os.environ.get("SOFFICE_PATH", "soffice")
 GHOSTSCRIPT_BIN = os.environ.get("GHOSTSCRIPT_PATH", "gs")
 
+# Matches the limits the Next.js app enforces on the same upload before it ever reaches
+# this service (lib/converter/validation.ts). Re-checked here too, since this service's
+# /convert/* endpoints are reachable directly by anyone with PYTHON_SERVICE_SECRET,
+# bypassing the Next.js layer entirely - without this, an oversized upload would still
+# get written to disk and handed to LibreOffice/pdfplumber, tying up a conversion slot
+# (LibreOffice in particular serializes on a single shared listener - see
+# _uno_conversion_lock) for however long that takes, or until it times out.
+MAX_OFFICE_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_PDF_UPLOAD_BYTES = 10 * 1024 * 1024
+
 # word/excel/ppt -> pdf normally spawns a brand-new LibreOffice process per request (see
 # _convert_with_soffice_spawn below), and LibreOffice's own startup - initializing its UNO
 # service manager, fonts, config - is a fixed ~10-15s cost regardless of document size. Setting
@@ -133,6 +143,19 @@ class InvalidFileError(Exception):
     collapsing both into one generic error was actively misleading users
     whose file was the actual issue (e.g. password-protected or corrupted)."""
     pass
+
+
+def enforce_max_upload_size(path: str, max_bytes: int, kind: str) -> None:
+    """Rejects a just-saved upload that exceeds max_bytes. Checked after writing to
+    disk (rather than trusting a Content-Length header, which a client can omit or
+    lie about) but before the expensive conversion step, so an oversized file fails
+    fast instead of tying up LibreOffice/pdfplumber for however long that would take."""
+    size = os.path.getsize(path)
+    if size > max_bytes:
+        raise InvalidFileError(
+            f"This {kind} file is {size / (1024 * 1024):.1f}MB, which is over the "
+            f"{max_bytes // (1024 * 1024)}MB limit. Please upload a smaller file."
+        )
 
 
 # OOXML (docx/xlsx/pptx) files are zip archives with a predictable member for
@@ -411,17 +434,39 @@ def convert_with_soffice(input_path: str, output_dir: str, target_format: str = 
     return _convert_with_soffice_spawn(input_path, output_dir, target_format)
 
 
+# Columns narrower than this (in characters) get widened to fit their content;
+# content longer than the cap wraps within the cell instead of widening the column
+# further - fitToWidth=1 below scales the *entire* printed page to fit one page wide,
+# so a single very-wide column (e.g. one long notes/description cell) would otherwise
+# force LibreOffice to shrink every other column's font down with it.
+_EXCEL_PDF_MIN_COL_WIDTH = 8
+_EXCEL_PDF_MAX_COL_WIDTH = 60
+
+
 def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
     """Force Calc's 'fit sheet to page width' plus a tight print area before handing off
     to LibreOffice. Headless --convert-to otherwise leaves pagination entirely to whatever
     the workbook happened to save - for most files exported from a web app or built from
     scraped/pasted data that's nothing, so a wide sheet gets sliced across several PDF
     pages mid-table instead of shrinking to fit one page wide, the way Excel's own
-    print preview normally behaves."""
+    print preview normally behaves.
+
+    Also auto-fits column widths to their content and wraps text that's too long to
+    fit even a generously widened column. Calc's headless print, like Excel's, only
+    lets a cell's text visually overflow into a truly *empty* neighboring cell - with
+    a normal table (every column filled), a column left at whatever narrow width it
+    happened to load with (very common for sheets exported from a web app or built
+    programmatically, where nobody ever manually resized columns) silently clips
+    every value wider than that column mid-word in the printed PDF, with no error and
+    no visual indication anything was cut off."""
     if ext not in (".xlsx", ".xlsm"):
         return
     try:
+        import textwrap
         from openpyxl import load_workbook
+        from openpyxl.styles import Alignment
+        from openpyxl.utils import get_column_letter
+
         wb = load_workbook(input_path)
         for ws in wb.worksheets:
             if ws.max_row < 1 or ws.max_column < 1:
@@ -432,6 +477,72 @@ def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
             ws.sheet_properties.pageSetUpPr.fitToPage = True
             if ws.max_column > 8:
                 ws.page_setup.orientation = "landscape"
+
+            # Pass 1: widen each column to fit its longest line of content (capped -
+            # see _EXCEL_PDF_MAX_COL_WIDTH above). Merged cells store their value only
+            # on the top-left cell - every other cell in the range reads as None here
+            # via .value and is skipped, so a merge's width is driven solely by that
+            # one real value, which is what we want.
+            needed_width = {}
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    text = str(cell.value)
+                    longest_line = max((len(line) for line in text.splitlines()), default=0)
+                    if longest_line > needed_width.get(cell.column, 0):
+                        needed_width[cell.column] = longest_line
+
+            final_width = {}
+            for col_idx, longest_line in needed_width.items():
+                letter = get_column_letter(col_idx)
+                target = min(max(longest_line + 2, _EXCEL_PDF_MIN_COL_WIDTH), _EXCEL_PDF_MAX_COL_WIDTH)
+                current = ws.column_dimensions[letter].width
+                final = max(current, target) if current else target
+                ws.column_dimensions[letter].width = final
+                final_width[col_idx] = final
+
+            # Pass 2: wrap any cell whose content still doesn't fit its (now final)
+            # column width, so the excess flows onto extra lines within the row
+            # instead of being clipped off the page. Headless LibreOffice does not
+            # recompute row heights for wrap_text cells the way opening the file in
+            # the actual app would - left alone, a wrapped cell's extra lines just
+            # overflow upward into the row above instead of the row growing to fit,
+            # so the line-broken text is inserted ourselves (textwrap, respecting
+            # word boundaries) and each row's height is set explicitly to match.
+            row_line_counts = {}
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    text = str(cell.value)
+                    col_width = final_width.get(cell.column, _EXCEL_PDF_MIN_COL_WIDTH)
+                    longest_line = max((len(line) for line in text.splitlines()), default=0)
+                    if "\n" not in text and longest_line <= col_width:
+                        continue
+
+                    wrap_width = max(int(col_width) - 1, 1)
+                    wrapped_lines = []
+                    for paragraph in text.split("\n"):
+                        wrapped_lines.extend(textwrap.wrap(paragraph, width=wrap_width) or [""])
+                    cell.value = "\n".join(wrapped_lines)
+
+                    existing = cell.alignment
+                    cell.alignment = Alignment(
+                        wrap_text=True,
+                        horizontal=existing.horizontal if existing else None,
+                        vertical="top",
+                    )
+                    row_line_counts[cell.row] = max(row_line_counts.get(cell.row, 1), len(wrapped_lines))
+
+            # ~15pt covers one line of Calc's default font with a little breathing
+            # room - matches the row height Calc itself falls back to for an
+            # unwrapped row, so single-line rows stay exactly as tall as before.
+            for row_idx, line_count in row_line_counts.items():
+                needed_height = line_count * 15.0
+                current_height = ws.row_dimensions[row_idx].height
+                if current_height is None or current_height < needed_height:
+                    ws.row_dimensions[row_idx].height = needed_height
         wb.save(input_path)
     except Exception as e:
         # Best-effort only - if the workbook can't be parsed (password-protected,
@@ -450,6 +561,7 @@ def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
 
+    enforce_max_upload_size(input_path, MAX_OFFICE_UPLOAD_BYTES, _KIND_BY_EXT.get(ext.lower(), "document"))
     validate_office_file(input_path, ext)
     prepare_excel_for_pdf(input_path, ext)
 
@@ -940,6 +1052,14 @@ def _convert_pdf_to_excel_sync(file_obj, temp_pdf_path: str, temp_xlsx_path: str
     with open(temp_pdf_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
 
+    enforce_max_upload_size(temp_pdf_path, MAX_PDF_UPLOAD_BYTES, "PDF")
+    # Reuses the same corrupt/password-protected checks the pdf-to-ppt pipeline already
+    # does - without this, a corrupt file reaches pdfplumber and fails with a raw,
+    # unhelpful library exception (e.g. "No /Root object! - Is this really a PDF?"), and
+    # a password-protected one fails with no message at all - both as an opaque 500
+    # instead of a clear, actionable error.
+    open_pdf_or_raise(temp_pdf_path).close()
+
     from openpyxl import Workbook
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
@@ -965,6 +1085,7 @@ def _convert_pdf_to_excel_sync(file_obj, temp_pdf_path: str, temp_xlsx_path: str
     current_row = 1
     prev_num_cols = None
     prev_header = None
+    looks_scanned = False  # any page with a full-page image but no extractable text at all
 
     with pdfplumber.open(temp_pdf_path) as pdf:
         for page in pdf.pages:
@@ -978,6 +1099,8 @@ def _convert_pdf_to_excel_sync(file_obj, temp_pdf_path: str, temp_xlsx_path: str
                 # never merge into one cell.
                 extracted_rows = []
                 words = page.extract_words(x_tolerance=1, y_tolerance=1)
+                if not words and page.images:
+                    looks_scanned = True
                 if words:
                     lines = []
                     current_line = []
@@ -1066,24 +1189,40 @@ def _convert_pdf_to_excel_sync(file_obj, temp_pdf_path: str, temp_xlsx_path: str
                             merged_regions.append([cur_start, cur_end])
                             i += 1
 
-                        for phrases in line_phrases:
-                            row_cells = [[] for _ in merged_regions]
-                            for p in phrases:
-                                p_text = " ".join([w['text'] for w in p])
-                                p_mid = (p[0]['x0'] + p[-1]['x1']) / 2.0
-                                matched_idx = -1
-                                for idx, (t_start, t_end) in enumerate(merged_regions):
-                                    if t_start - 2 <= p_mid <= t_end + 2:
-                                        matched_idx = idx
-                                        break
-                                if matched_idx == -1:
-                                    distances = [abs(p_mid - (t_start + t_end)/2.0) for t_start, t_end in merged_regions]
-                                    matched_idx = distances.index(min(distances))
-                                row_cells[matched_idx].append(p_text)
+                        # Sanity check before trusting these column bands: a real table
+                        # reuses a small, consistent set of columns across several rows.
+                        # Ordinary prose - a couple of lines of a paragraph, each wrapped
+                        # independently - can accidentally produce just as many "column"
+                        # bands as there are words, since normal word-to-word spacing on
+                        # a text line looks identical to a column gap to the coverage scan
+                        # above. Below this confidence bar (many candidate columns, too
+                        # few lines to show they're real), keep each line as one plain
+                        # text cell instead of shredding every sentence word-by-word.
+                        is_plausible_table = not (len(merged_regions) > 6 and len(line_phrases) < 5)
 
-                            row = [" ".join(c) if c else "" for c in row_cells]
-                            while row and row[-1] == "":
-                                row.pop()
+                        for phrases in line_phrases:
+                            if is_plausible_table:
+                                row_cells = [[] for _ in merged_regions]
+                                for p in phrases:
+                                    p_text = " ".join([w['text'] for w in p])
+                                    p_mid = (p[0]['x0'] + p[-1]['x1']) / 2.0
+                                    matched_idx = -1
+                                    for idx, (t_start, t_end) in enumerate(merged_regions):
+                                        if t_start - 2 <= p_mid <= t_end + 2:
+                                            matched_idx = idx
+                                            break
+                                    if matched_idx == -1:
+                                        distances = [abs(p_mid - (t_start + t_end)/2.0) for t_start, t_end in merged_regions]
+                                        matched_idx = distances.index(min(distances))
+                                    row_cells[matched_idx].append(p_text)
+
+                                row = [" ".join(c) if c else "" for c in row_cells]
+                                while row and row[-1] == "":
+                                    row.pop()
+                            else:
+                                line_text = " ".join(w['text'] for p in phrases for w in p)
+                                row = [line_text] if line_text else []
+
                             if any(row):
                                 extracted_rows.append(row)
 
@@ -1125,6 +1264,17 @@ def _convert_pdf_to_excel_sync(file_obj, temp_pdf_path: str, temp_xlsx_path: str
                 prev_num_cols = num_cols
                 prev_header = raw_rows[0] if raw_rows else None
 
+    if current_row == 1 and looks_scanned:
+        # Nothing was extracted anywhere in the document, and at least one page is a
+        # full-page image with no text layer at all - a scanned document (photo, fax,
+        # scanned invoice/receipt) rather than a real text PDF. Returning a "successful"
+        # but silently blank spreadsheet here would be actively misleading - there is
+        # no table data to extract without OCR, which this endpoint doesn't do.
+        raise InvalidFileError(
+            "This PDF looks like a scanned document - it has no selectable text, only "
+            "images. Please run it through an OCR tool first, then upload the result here."
+        )
+
     for col_idx, width in max_col_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width + 2, 8), 60)
 
@@ -1144,6 +1294,9 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_xlsx_path])
         return FileResponse(path=temp_xlsx_path, filename=f"converted_{file.filename}.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except InvalidFileError as e:
+        remove_files([temp_pdf_path, temp_xlsx_path])
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         remove_files([temp_pdf_path, temp_xlsx_path])
         raise HTTPException(status_code=500, detail=str(e))
