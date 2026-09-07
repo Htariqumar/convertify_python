@@ -12,3 +12,10 @@ wordninja
 edge-tts>=7.2.8
 faster-whisper
 imageio-ffmpeg
+
+# Client for the persistent LibreOffice listener used by convert_with_soffice() in main.py
+# (see USE_PERSISTENT_LIBREOFFICE). Only the client class is used here (pure Python, talks to
+# the listener over a local socket) - it does NOT need LibreOffice's `uno` bridge module, which
+# is only required by the separate listener *server* process (started with UNOSERVER_PYTHON,
+# not this venv's Python - see the Dockerfile).
+unoserver

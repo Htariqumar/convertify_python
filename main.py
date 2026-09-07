@@ -12,11 +12,15 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import socket
 import subprocess
+import threading
+import time
 import zipfile
 import edge_tts
 from pydantic import BaseModel, Field
 import imageio_ffmpeg
+from unoserver.client import UnoClient
 
 # LibreOffice (word/excel/ppt <-> pdf) and Ghostscript (compress-pdf, thumbnails) run here
 # rather than in the Vercel Next.js app because neither fits a serverless function: Vercel
@@ -25,6 +29,27 @@ import imageio_ffmpeg
 # both are installed as regular system packages - see the Dockerfile.
 SOFFICE_BIN = os.environ.get("SOFFICE_PATH", "soffice")
 GHOSTSCRIPT_BIN = os.environ.get("GHOSTSCRIPT_PATH", "gs")
+
+# word/excel/ppt -> pdf normally spawns a brand-new LibreOffice process per request (see
+# _convert_with_soffice_spawn below), and LibreOffice's own startup - initializing its UNO
+# service manager, fonts, config - is a fixed ~10-15s cost regardless of document size. Setting
+# this keeps one LibreOffice instance running persistently instead (via the `unoserver` project)
+# and routes conversions through it, paying that startup cost once instead of on every request -
+# see convert_via_uno_listener. Falls back automatically to the slower per-request spawn if the
+# listener can't start, or (per-file-extension, see the circuit breaker below) if it keeps
+# crashing on a given format, so this is safe to leave on even where the listener doesn't work.
+USE_PERSISTENT_LIBREOFFICE = os.environ.get("USE_PERSISTENT_LIBREOFFICE", "true").lower() not in ("false", "0", "no")
+# Must be a Python interpreter that has LibreOffice's `uno` bridge module importable - that's
+# never this service's own venv (installing `uno` there isn't a normal pip package). On the
+# Linux/Docker deployment that's the system python3 after `apt-get install python3-uno` (see
+# Dockerfile); on Windows it's LibreOffice's bundled program\python.exe. Only the *listener*
+# process (spawned with this interpreter) needs the uno bridge - this service talks to it as a
+# plain network client via the `unoserver` pip package (see requirements.txt), which needs no
+# uno import of its own.
+UNOSERVER_PYTHON = os.environ.get("UNOSERVER_PYTHON", "python3")
+UNO_LISTENER_HOST = os.environ.get("UNO_LISTENER_HOST", "127.0.0.1")
+UNO_LISTENER_PORT = os.environ.get("UNO_LISTENER_PORT", "2003")
+UNO_INTERNAL_PORT = os.environ.get("UNO_INTERNAL_PORT", "2002")
 
 # Automatically append the bundled ffmpeg to the system PATH
 os.environ["PATH"] += os.pathsep + os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
@@ -71,6 +96,22 @@ async def verify_internal_secret(request: Request, call_next):
 def read_root():
     return {"message": "Python Microservice is running!"}
 
+
+@app.on_event("startup")
+async def _warm_up_uno_listener():
+    """Best-effort: start the persistent LibreOffice listener at boot so the first real
+    word/excel/ppt<->pdf request doesn't have to pay its ~10-15s startup cost itself. If this
+    fails (e.g. UNOSERVER_PYTHON not configured for this host), convert_with_soffice() falls
+    back to the per-request spawn transparently - so this is never fatal to startup."""
+    if USE_PERSISTENT_LIBREOFFICE:
+        await run_in_threadpool(_ensure_uno_listener)
+
+
+@app.on_event("shutdown")
+async def _shut_down_uno_listener():
+    with _uno_listener_state_lock:
+        _stop_uno_listener_locked()
+
 def remove_files(paths):
     for path in paths:
         try:
@@ -80,10 +121,98 @@ def remove_files(paths):
             print(f"Error removing {path}: {e}")
 
 
-def convert_with_soffice(input_path: str, output_dir: str, target_format: str = "pdf") -> str:
-    """Converts a document to the given format via headless LibreOffice (e.g. word/excel/ppt -> pdf,
-    or pdf -> docx). Each call gets its own -env:UserInstallation profile dir so concurrent requests
-    don't collide on LibreOffice's single-instance profile lock."""
+class InvalidFileError(Exception):
+    """Raised when the uploaded file itself is the problem - corrupted, empty,
+    password-protected, or not actually the format its extension claims - as
+    opposed to an unexpected server/infrastructure failure. Endpoints turn this
+    into a 422 with the message shown directly to the user, so messages here
+    must always be safe to show as-is: no filesystem paths, no raw library
+    exception text. Kept distinct from a plain 500 so the Next.js caller (and
+    ultimately the end user) can tell "your file has a problem, fix it and
+    re-upload" apart from "something is wrong on our end, retrying may help" -
+    collapsing both into one generic error was actively misleading users
+    whose file was the actual issue (e.g. password-protected or corrupted)."""
+    pass
+
+
+# OOXML (docx/xlsx/pptx) files are zip archives with a predictable member for
+# their main content part; legacy (doc/xls/ppt) files are OLE2 compound files
+# with a fixed 8-byte magic number. Checking these before handing a file to
+# LibreOffice matters because --convert-to auto-detects the import filter and
+# will happily import a garbage/plain-text file as a *text document*, silently
+# producing a "successful" PDF that just contains the raw garbage as text -
+# instead of failing, which is what a corrupted or mislabeled upload should do.
+_OOXML_MAIN_PART = {
+    ".docx": "word/document.xml",
+    ".xlsx": "xl/workbook.xml",
+    ".pptx": "ppt/presentation.xml",
+}
+_LEGACY_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_KIND_BY_EXT = {
+    ".doc": "Word", ".docx": "Word",
+    ".xls": "Excel", ".xlsx": "Excel",
+    ".ppt": "PowerPoint", ".pptx": "PowerPoint",
+}
+
+
+def validate_office_file(input_path: str, ext: str) -> None:
+    """Rejects a file that doesn't actually match the Office format its extension
+    claims, before it ever reaches LibreOffice. See InvalidFileError and the
+    module-level comment above for why this check exists."""
+    ext = ext.lower()
+    kind = _KIND_BY_EXT.get(ext, "document")
+    bad_file_message = (
+        f"This doesn't look like a valid {kind} file. It may be corrupted, empty, or not "
+        f"actually a {kind} document - please check the file and try again."
+    )
+
+    if ext in _OOXML_MAIN_PART:
+        try:
+            with zipfile.ZipFile(input_path) as zf:
+                names = zf.namelist()
+                if "[Content_Types].xml" not in names or _OOXML_MAIN_PART[ext] not in names:
+                    raise InvalidFileError(bad_file_message)
+        except zipfile.BadZipFile:
+            raise InvalidFileError(bad_file_message)
+    elif ext in (".doc", ".xls", ".ppt"):
+        with open(input_path, "rb") as f:
+            header = f.read(8)
+        if header != _LEGACY_OLE_MAGIC:
+            raise InvalidFileError(bad_file_message)
+
+
+def open_pdf_or_raise(pdf_path: str) -> fitz.Document:
+    """Opens a PDF for the pdf-to-ppt pipeline with a clear, user-safe
+    InvalidFileError for the two most common bad-input cases - unreadable/corrupt
+    file and password-protected file - instead of letting PyMuPDF's low-level
+    errors (e.g. "Failed to open file 'C:\\Users\\...\\tmp78ysehkd.pdf' as type
+    pdf" or "document closed or encrypted") reach the client. Those messages are
+    both cryptic to an end user and, in the corrupt-file case, leak the server's
+    internal temp file path."""
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        raise InvalidFileError(
+            "This doesn't look like a valid PDF file. It may be corrupted or not actually "
+            "a PDF - please check the file and try again."
+        )
+    if doc.needs_pass:
+        doc.close()
+        raise InvalidFileError(
+            "This PDF is password-protected. Please remove the password (e.g. via your PDF "
+            "viewer's \"Print to PDF\" or a password-removal tool) and upload it again."
+        )
+    return doc
+
+
+def _convert_with_soffice_spawn(input_path: str, output_dir: str, target_format: str = "pdf") -> str:
+    """The original conversion path: spawns a brand-new LibreOffice process for this one
+    conversion, with its own throwaway -env:UserInstallation profile dir so concurrent requests
+    don't collide on LibreOffice's single-instance profile lock. Slower (~10-15s LibreOffice
+    startup cost paid on every single call, regardless of document size) but has no shared,
+    crashable state - used directly when USE_PERSISTENT_LIBREOFFICE is off, and as the automatic
+    fallback from convert_with_soffice() when the persistent listener is unavailable or unreliable
+    for a given file type."""
     profile_dir = tempfile.mkdtemp()
     try:
         # Path(...).as_uri() (not a manual f"file://{profile_dir}") because that manual form is
@@ -111,6 +240,175 @@ def convert_with_soffice(input_path: str, output_dir: str, target_format: str = 
         stderr = result.stderr.decode(errors="ignore") if result.stderr else "unknown error"
         raise RuntimeError(f"LibreOffice conversion failed: {stderr}")
     return output_path
+
+
+# --- Persistent LibreOffice listener (see USE_PERSISTENT_LIBREOFFICE above) -----------------
+#
+# unoserver's own docs are explicit that it does *not* restart LibreOffice after a crash and
+# expects whatever wraps it to handle that - the state and functions below are that wrapper:
+# start/detect-death/restart the listener process, and a small per-file-extension circuit
+# breaker so a format that reliably crashes the listener (observed in testing with some Impress
+# ->PDF exports) doesn't end up slower than never having a fast path at all (fast attempt that
+# crashes + listener restart + slow fallback, repeated on every request for that format).
+_uno_listener_process = None
+_uno_listener_profile_dir = None
+_uno_listener_state_lock = threading.Lock()   # guards starting/stopping the listener process
+_uno_conversion_lock = threading.Lock()       # serializes conversions - only one at a time can use the single listener
+
+_UNO_FAILURE_THRESHOLD = 2
+_UNO_BREAKER_COOLDOWN_SECONDS = 30 * 60
+_uno_failure_counts: dict = {}   # file extension -> consecutive fast-path failure count
+_uno_breaker_until: dict = {}    # file extension -> timestamp until which the fast path is skipped
+_uno_breaker_lock = threading.Lock()
+
+
+def _uno_listener_reachable() -> bool:
+    try:
+        with socket.create_connection((UNO_LISTENER_HOST, int(UNO_LISTENER_PORT)), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _stop_uno_listener_locked() -> None:
+    """Caller must hold _uno_listener_state_lock."""
+    global _uno_listener_process, _uno_listener_profile_dir
+    if _uno_listener_process is not None:
+        try:
+            _uno_listener_process.terminate()
+            _uno_listener_process.wait(timeout=5)
+        except Exception:
+            try:
+                _uno_listener_process.kill()
+            except Exception:
+                pass
+        _uno_listener_process = None
+    if _uno_listener_profile_dir:
+        shutil.rmtree(_uno_listener_profile_dir, ignore_errors=True)
+        _uno_listener_profile_dir = None
+
+
+def _start_uno_listener_locked() -> bool:
+    """(Re)starts the persistent LibreOffice listener. Caller must hold _uno_listener_state_lock.
+    Returns whether it came up and is reachable - false means the caller should fall back to
+    _convert_with_soffice_spawn instead."""
+    global _uno_listener_process, _uno_listener_profile_dir
+    _stop_uno_listener_locked()
+
+    _uno_listener_profile_dir = tempfile.mkdtemp(prefix="uno_listener_profile_")
+    try:
+        _uno_listener_process = subprocess.Popen(
+            [
+                UNOSERVER_PYTHON, "-m", "unoserver.server",
+                "--interface", UNO_LISTENER_HOST,
+                "--port", UNO_LISTENER_PORT,
+                "--uno-port", UNO_INTERNAL_PORT,
+                "--user-installation", _uno_listener_profile_dir,
+                # Without this, a conversion that hangs (rather than cleanly crashing) would
+                # block the shared listener - and every request waiting on _uno_conversion_lock
+                # behind it - forever. Hitting this also makes unoserver exit, which the crash
+                # handling in convert_via_uno_listener already restarts from.
+                "--conversion-timeout", "60",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"[uno-listener] failed to spawn ({UNOSERVER_PYTHON} -m unoserver.server): {e}")
+        _uno_listener_process = None
+        return False
+
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if _uno_listener_process.poll() is not None:
+            print(f"[uno-listener] process exited during startup (code {_uno_listener_process.returncode})")
+            return False
+        if _uno_listener_reachable():
+            print("[uno-listener] ready")
+            return True
+        time.sleep(0.5)
+    print("[uno-listener] did not become reachable within 25s")
+    _stop_uno_listener_locked()
+    return False
+
+
+def _ensure_uno_listener() -> bool:
+    with _uno_listener_state_lock:
+        if _uno_listener_process is not None and _uno_listener_process.poll() is None:
+            return True
+        return _start_uno_listener_locked()
+
+
+def _uno_breaker_open(ext: str) -> bool:
+    with _uno_breaker_lock:
+        until = _uno_breaker_until.get(ext)
+        return until is not None and time.time() < until
+
+
+def _uno_record_success(ext: str) -> None:
+    with _uno_breaker_lock:
+        _uno_failure_counts[ext] = 0
+        _uno_breaker_until.pop(ext, None)
+
+
+def _uno_record_failure(ext: str) -> None:
+    with _uno_breaker_lock:
+        count = _uno_failure_counts.get(ext, 0) + 1
+        _uno_failure_counts[ext] = count
+        if count >= _UNO_FAILURE_THRESHOLD:
+            _uno_breaker_until[ext] = time.time() + _UNO_BREAKER_COOLDOWN_SECONDS
+            print(
+                f"[uno-listener] {count} consecutive failures converting {ext} - disabling the "
+                f"fast path for it for {_UNO_BREAKER_COOLDOWN_SECONDS // 60} min"
+            )
+
+
+def convert_via_uno_listener(input_path: str, output_dir: str, target_format: str) -> str:
+    """Converts via the persistent listener instead of spawning a new LibreOffice process.
+    Raises RuntimeError if the listener isn't usable right now - convert_with_soffice() catches
+    that and falls back to _convert_with_soffice_spawn()."""
+    if not _ensure_uno_listener():
+        raise RuntimeError("uno listener unavailable")
+
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = os.path.join(output_dir, f"{base_name}.{target_format}")
+    client = UnoClient(server=UNO_LISTENER_HOST, port=UNO_LISTENER_PORT)
+
+    with _uno_conversion_lock:
+        try:
+            client.convert(inpath=input_path, outpath=output_path, convert_to=target_format)
+        except Exception as e:
+            # Observed in testing: a conversion that crashes LibreOffice takes the whole
+            # listener down with it, and unoserver does not restart itself after that (by
+            # design, per its own docs) - restart it now so the *next* request gets a fresh,
+            # working listener instead of repeatedly hitting a dead one.
+            with _uno_listener_state_lock:
+                _start_uno_listener_locked()
+            raise RuntimeError(f"uno listener conversion failed: {e}")
+
+    if not os.path.exists(output_path):
+        raise RuntimeError("uno listener reported success but produced no output file")
+    return output_path
+
+
+def convert_with_soffice(input_path: str, output_dir: str, target_format: str = "pdf") -> str:
+    """Converts a document to the given format via LibreOffice (e.g. word/excel/ppt -> pdf).
+    Tries the fast persistent-listener path first, and transparently falls back to the original
+    per-request LibreOffice spawn if the listener is disabled (USE_PERSISTENT_LIBREOFFICE=false),
+    unavailable, or has repeatedly failed to convert this file extension recently (the circuit
+    breaker above)."""
+    ext = os.path.splitext(input_path)[1].lower()
+
+    if USE_PERSISTENT_LIBREOFFICE and not _uno_breaker_open(ext):
+        try:
+            result = convert_via_uno_listener(input_path, output_dir, target_format)
+            _uno_record_success(ext)
+            return result
+        except Exception as e:
+            print(f"[uno-listener] fast path failed for '{ext}', falling back to per-request soffice: {e}")
+            _uno_record_failure(ext)
+
+    return _convert_with_soffice_spawn(input_path, output_dir, target_format)
 
 
 def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
@@ -152,6 +450,7 @@ def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
 
+    validate_office_file(input_path, ext)
     prepare_excel_for_pdf(input_path, ext)
 
     return convert_with_soffice(input_path, work_dir)
@@ -169,9 +468,16 @@ async def office_to_pdf_response(background_tasks: BackgroundTasks, file: Upload
 
         background_tasks.add_task(shutil.rmtree, work_dir, True)
         return FileResponse(path=output_path, filename=f"converted_{file.filename}.pdf", media_type="application/pdf")
+    except InvalidFileError as e:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[office-to-pdf] conversion failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="We couldn't convert this file due to an unexpected server error. Please try again shortly.",
+        )
 
 def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str) -> str:
     """All the blocking work for pdf-to-word: writing the upload to disk, the pdf2docx
@@ -864,7 +1170,7 @@ def _convert_pdf_to_ppt_sync(file_obj, temp_pdf_path: str, temp_pptx_path: str) 
     with open(temp_pdf_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
 
-    doc = fitz.open(temp_pdf_path)
+    doc = open_pdf_or_raise(temp_pdf_path)
     prs = Presentation()
     blank_slide_layout = prs.slide_layouts[6] # blank layout
 
@@ -1076,9 +1382,16 @@ async def convert_pdf_to_ppt(background_tasks: BackgroundTasks, file: UploadFile
 
         background_tasks.add_task(remove_files, [temp_pdf_path, temp_pptx_path])
         return FileResponse(path=temp_pptx_path, filename=f"converted_{file.filename}.pptx", media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    except InvalidFileError as e:
+        remove_files([temp_pdf_path, temp_pptx_path])
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         remove_files([temp_pdf_path, temp_pptx_path])
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[pdf-to-ppt] conversion failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="We couldn't convert this file due to an unexpected server error. Please try again shortly.",
+        )
 
 def _convert_pdf_to_images_sync(file_obj, temp_pdf_path: str, temp_zip_path: str) -> None:
     """All the blocking work for pdf-to-images: writing the upload to disk and rendering each
