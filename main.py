@@ -584,7 +584,18 @@ def _fix_fragile_floating_images(tree) -> bool:
     Converting to inline removes the offset entirely: the image sits directly in the text
     flow at the point it's inserted, so it moves together with whatever paragraph it's next
     to instead of drifting independently. relativeFrom="page"/"margin" anchors are left alone
-    - those are already an absolute position on the page, immune to this failure mode."""
+    - those are already an absolute position on the page, immune to this failure mode.
+
+    One thing a floating image's independence from run order hides: Word will happily let a
+    document's <w:drawing> run come *before* a caption/label run in the XML (e.g. an "Output:"
+    caption typed after the picture was already inserted) while still rendering the caption
+    above the picture, purely from the anchor's own offset - run order plays no part. An
+    inline image has no such independence; it renders exactly in run order. Left alone, that
+    caption would render immediately after the now-inline image on the same line, its text
+    sitting right on the image's bottom edge instead of above it. So when a converted image's
+    run is followed by a same-paragraph run that still has real text, that run gets moved
+    after the image - restoring the "label, then image" reading order the offset used to
+    fake, instead of introducing this exact same class of glued-together bug."""
     from lxml import etree
 
     changed = False
@@ -593,8 +604,8 @@ def _fix_fragile_floating_images(tree) -> bool:
         if position_v is None or position_v.get("relativeFrom") not in ("paragraph", "line"):
             continue
 
-        parent = anchor.getparent()
-        inline = etree.SubElement(parent, f"{{{_WP_NS}}}inline")
+        drawing = anchor.getparent()
+        inline = etree.SubElement(drawing, f"{{{_WP_NS}}}inline")
         for attr in ("distT", "distB", "distL", "distR"):
             if anchor.get(attr) is not None:
                 inline.set(attr, anchor.get(attr))
@@ -606,8 +617,20 @@ def _fix_fragile_floating_images(tree) -> bool:
         if graphic is not None:
             inline.append(graphic)
 
-        parent.remove(anchor)
+        drawing.remove(anchor)
         changed = True
+
+        run = drawing.getparent()
+        para = run.getparent()
+        siblings = list(para)
+        run_idx = siblings.index(run)
+        following_text_runs = [
+            r for r in siblings[run_idx + 1:]
+            if r.tag == f"{{{_W_NS}}}r" and "".join(t.text or "" for t in r.findall(f"{{{_W_NS}}}t")).strip()
+        ]
+        if following_text_runs:
+            para.remove(run)
+            following_text_runs[-1].addnext(run)
     return changed
 
 
