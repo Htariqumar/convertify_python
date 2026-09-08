@@ -4,6 +4,15 @@ FROM python:3.11-slim
 # pdf thumbnails) - both installed as normal Debian packages since this runs on a regular
 # Linux host, not a size-capped serverless function. fonts-* packages keep converted
 # documents from silently substituting missing glyphs.
+#
+# fonts-liberation covers Arial/Times New Roman/Courier New (metric-compatible), but most
+# .docx files created in modern Word default to Calibri (body) and Cambria (headings) -
+# with neither font installed, LibreOffice's DOCX import silently substitutes a font with
+# different character widths, which reflows line breaks/spacing/pagination differently
+# than Word itself would lay the same document out. fonts-crosextra-carlito/-caladea are
+# Google's metric-compatible substitutes for exactly those two fonts (same glyph widths,
+# so text wraps at the same points Word would use), and are the single highest-impact fix
+# for docx/pptx -> pdf formatting drift from the source document.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     python3-uno \
@@ -11,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     fonts-dejavu \
     fonts-liberation \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
     && rm -rf /var/lib/apt/lists/*
 
 # main.py keeps one LibreOffice instance running persistently (via `unoserver`, see
