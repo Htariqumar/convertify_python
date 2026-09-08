@@ -631,6 +631,7 @@ _HANDLED_WORD_FONTS = {
     "calibri", "cambria", "cambria math", "aptos", "aptos display", "aptos serif",
     "arial", "arial black", "times new roman", "courier new",
     "segoe ui", "tahoma", "verdana", "georgia", "consolas",
+    "segoe ui emoji", "noto color emoji",
     "dejavu sans", "dejavu serif", "dejavu sans mono",
     "liberation sans", "liberation serif", "liberation mono",
     "carlito", "caladea", "symbol", "wingdings",

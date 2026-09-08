@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-crosextra-carlito \
     fonts-crosextra-caladea \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # Word's newest default theme font, "Aptos" (2023, replacing Calibri), has no freely
@@ -31,6 +32,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # fontconfig-aliases.conf for the full explanation). This aliases "Aptos"/"Aptos Display"
 # to the Carlito/Caladea already installed above, so LibreOffice gets a reasonably close,
 # consistent substitute instead of fontconfig's own generic (and worse-matching) fallback.
+# It also aliases "Segoe UI Emoji" (the font Word tags emoji/symbol characters with, even in
+# plain text documents) to fonts-noto-color-emoji above - without it, none of the fonts here
+# have those glyphs at all, so emoji/dingbat characters (checkmarks, arrows, etc.) convert to
+# empty boxes in the PDF instead of just looking visually different.
 COPY fontconfig-aliases.conf /etc/fonts/local.conf
 RUN fc-cache -f
 
