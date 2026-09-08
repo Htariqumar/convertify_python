@@ -565,14 +565,57 @@ def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
 # the text at full size instead - not pixel-identical to Word's shrunk-font rendering, but
 # it guarantees every word stays visible instead of silently disappearing.
 _DRAWINGML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 _WORD_XML_AUTOFIT_PARTS = re.compile(r"^word/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$")
 
 
+def _fix_fragile_floating_images(tree) -> bool:
+    """Converts a floating image anchored relativeFrom="paragraph"/"line" into an inline one.
+
+    Word positions such an image as an *offset from wherever its anchor paragraph ends up*,
+    not an absolute page position. That's fine as long as the anchor paragraph lands in the
+    same place it did in Word - but LibreOffice's layout (line-height/paragraph-spacing
+    rounding, font-substitution differences, etc.) never reproduces Word's paragraph flow
+    exactly, especially many paragraphs into a long document. Two images anchored just a few
+    paragraphs apart can end up with their anchor paragraphs much closer together than Word
+    laid them out, so the same relative offsets now put both images at nearly the same
+    absolute position - overlapping in the PDF even though Word kept them apart.
+
+    Converting to inline removes the offset entirely: the image sits directly in the text
+    flow at the point it's inserted, so it moves together with whatever paragraph it's next
+    to instead of drifting independently. relativeFrom="page"/"margin" anchors are left alone
+    - those are already an absolute position on the page, immune to this failure mode."""
+    from lxml import etree
+
+    changed = False
+    for anchor in tree.findall(f".//{{{_WP_NS}}}anchor"):
+        position_v = anchor.find(f"{{{_WP_NS}}}positionV")
+        if position_v is None or position_v.get("relativeFrom") not in ("paragraph", "line"):
+            continue
+
+        parent = anchor.getparent()
+        inline = etree.SubElement(parent, f"{{{_WP_NS}}}inline")
+        for attr in ("distT", "distB", "distL", "distR"):
+            if anchor.get(attr) is not None:
+                inline.set(attr, anchor.get(attr))
+        for tag in ("extent", "effectExtent", "docPr", "cNvGraphicFramePr"):
+            el = anchor.find(f"{{{_WP_NS}}}{tag}")
+            if el is not None:
+                inline.append(el)
+        graphic = anchor.find(f"{{{_DRAWINGML_NS}}}graphic")
+        if graphic is not None:
+            inline.append(graphic)
+
+        parent.remove(anchor)
+        changed = True
+    return changed
+
+
 def prepare_word_for_pdf(input_path: str, ext: str) -> None:
-    """Rewrites any 'shrink text on overflow' text box/shape in a .docx to 'resize shape to
-    fit text' instead, so LibreOffice's DOCX->PDF conversion doesn't clip text out of
-    title/heading boxes that Word itself would have rendered by shrinking the font. Only
-    .docx is a zip/XML container - legacy .doc has no such fix available."""
+    """Two independent best-effort fixes for .docx -> PDF fidelity issues LibreOffice's own
+    DOCX import doesn't handle the way Word does - see _fix_fragile_floating_images and the
+    normAutofit->spAutoFit rewrite below. Only .docx is a zip/XML container - legacy .doc has
+    no such fix available."""
     if ext != ".docx":
         return
     try:
@@ -587,7 +630,7 @@ def prepare_word_for_pdf(input_path: str, ext: str) -> None:
             if not _WORD_XML_AUTOFIT_PARTS.match(name):
                 continue
             tree = etree.fromstring(parts[name])
-            part_changed = False
+            part_changed = _fix_fragile_floating_images(tree)
             for body_pr in tree.iter():
                 if not body_pr.tag.endswith("}bodyPr"):
                     continue
