@@ -9,6 +9,7 @@ import fitz # PyMuPDF
 import tempfile
 import os
 from pathlib import Path
+import json
 import re
 import secrets
 import shutil
@@ -16,6 +17,8 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import zipfile
 import edge_tts
 from pydantic import BaseModel, Field
@@ -613,6 +616,211 @@ def prepare_word_for_pdf(input_path: str, ext: str) -> None:
         print(f"[word-to-pdf] textbox-autofit pre-processing skipped: {e}")
 
 
+# Fonts this conversion path can render the way Word intended - either because a
+# metric-compatible open substitute is actually installed (fonts-crosextra-carlito/-caladea,
+# fonts-liberation - see Dockerfile) and LibreOffice's own built-in substitution table maps
+# the Word font name to it automatically (true for Calibri/Cambria/Arial/Times New
+# Roman/Courier New), or because fontconfig-aliases.conf explicitly redirects the name to
+# one of those substitutes ourselves (Aptos, Segoe UI, Tahoma, Verdana, Georgia, Consolas).
+# Any docx font *outside* this set silently gets fontconfig's own generic default fallback
+# from LibreOffice (usually DejaVu Sans/Serif) instead - a font with different character
+# widths that reflows the document's layout away from how Word renders it. That's the exact
+# failure mode behind both the Calibri and Aptos bugs already fixed above; this list is our
+# running record of which fonts we've confirmed are handled one way or the other.
+_HANDLED_WORD_FONTS = {
+    "calibri", "cambria", "cambria math", "aptos", "aptos display", "aptos serif",
+    "arial", "arial black", "times new roman", "courier new",
+    "segoe ui", "tahoma", "verdana", "georgia", "consolas",
+    "dejavu sans", "dejavu serif", "dejavu sans mono",
+    "liberation sans", "liberation serif", "liberation mono",
+    "carlito", "caladea", "symbol", "wingdings",
+}
+
+# w:asciiTheme="minorHAnsi" etc. point a run at whichever font theme1.xml assigns to the
+# "Body" (minor) or "Headings" (major) theme slot, instead of naming a font directly.
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_THEME_ATTR_TO_SLOT = {
+    "asciiTheme": "minor", "hAnsiTheme": "minor", "cstheme": "minor", "eastAsiaTheme": "minor",
+    "majorHAnsiTheme": "major", "majorAsciiTheme": "major", "majorBidiTheme": "major",
+    "majorEastAsiaTheme": "major",
+}
+
+
+def _resolve_theme_fonts(theme_xml: bytes) -> dict:
+    """Reads word/theme/theme1.xml's <a:majorFont>/<a:minorFont> Latin typeface - the fonts
+    a run falls back to when it points at the theme (w:asciiTheme="minorHAnsi" etc.) instead
+    of naming a font directly, which is how a plain, unstyled run ends up in whatever font
+    Word's "Body"/"Headings" theme slot is set to (Aptos/Calibri/etc - see prepare_word_for_pdf
+    for why that matters for LibreOffice)."""
+    from lxml import etree
+
+    fonts = {}
+    tree = etree.fromstring(theme_xml)
+    for el in tree.iter():
+        slot = "major" if el.tag.endswith("}majorFont") else "minor" if el.tag.endswith("}minorFont") else None
+        if slot is None or slot in fonts:
+            continue
+        latin = el.find(f"{{{_DRAWINGML_NS}}}latin")
+        if latin is not None and latin.get("typeface"):
+            fonts[slot] = latin.get("typeface")
+    return fonts
+
+
+def _fonts_referenced_in_part(tree, theme_fonts: dict) -> set:
+    names = set()
+    for el in tree.iter():
+        if not el.tag.endswith("}rFonts"):
+            continue
+        literal_found = False
+        for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
+            val = el.get(f"{{{_W_NS}}}{attr}")
+            if val:
+                names.add(val)
+                literal_found = True
+        if not literal_found:
+            for attr, slot in _THEME_ATTR_TO_SLOT.items():
+                if el.get(f"{{{_W_NS}}}{attr}") and theme_fonts.get(slot):
+                    names.add(theme_fonts[slot])
+    return names
+
+
+def _unhandled_docx_fonts(input_path: str) -> list:
+    """Returns the sorted list of fonts this .docx asks for that aren't in
+    _HANDLED_WORD_FONTS - pure detection, no side effects. Raises on a malformed docx; callers
+    decide what "best-effort" means for their situation."""
+    from lxml import etree
+
+    with zipfile.ZipFile(input_path, "r") as z:
+        names = z.namelist()
+        theme_fonts = _resolve_theme_fonts(z.read("word/theme/theme1.xml")) if "word/theme/theme1.xml" in names else {}
+
+        used_fonts = set(theme_fonts.values())
+        for part in names:
+            if part not in ("word/document.xml", "word/styles.xml") and not _WORD_XML_AUTOFIT_PARTS.match(part):
+                continue
+            tree = etree.fromstring(z.read(part))
+            used_fonts |= _fonts_referenced_in_part(tree, theme_fonts)
+
+    return sorted(f for f in used_fonts if f and f.lower() not in _HANDLED_WORD_FONTS)
+
+
+# Where a font fetched at runtime (see _fetch_google_font) gets installed - one of the
+# directories Debian's default fontconfig config scans on its own (alongside /usr/share/fonts),
+# so dropping a file here needs no fontconfig.conf changes, just an `fc-cache` refresh.
+_DYNAMIC_FONTS_DIR = "/usr/local/share/fonts/dynamic"
+# The google/fonts GitHub repo (what fonts.google.com itself is generated from) keeps every
+# family's TTFs under one of these three license directories - almost all are "ofl", so that
+# match usually costs one lookup.
+_GOOGLE_FONTS_LICENSE_DIRS = ("ofl", "apache", "ufl")
+_dynamic_font_lock = threading.Lock()
+# family name (lowercased) -> True (fetched this process's lifetime) / False (looked up,
+# not on Google Fonts or the fetch failed) - avoids re-hitting GitHub's API (60 req/hour
+# unauthenticated) for the same miss on every subsequent conversion.
+_dynamic_font_attempted: dict = {}
+
+
+def _fetch_google_font(family: str) -> bool:
+    """Best-effort: downloads a Google Fonts family's regular-weight TTF from the google/fonts
+    GitHub repo into _DYNAMIC_FONTS_DIR. Only covers fonts Google Fonts actually hosts (mostly
+    open-source web fonts) - Word/Office's own default fonts (Calibri, Aptos, Segoe UI, ...)
+    are Microsoft's and were never going to be here; those still rely on the static substitute
+    table above. Returns True only if a new file was actually written, so the caller knows
+    whether a font-cache refresh is worth its cost."""
+    slug = re.sub(r"[^a-z0-9]", "", family.lower())
+    if not slug:
+        return False
+    for license_dir in _GOOGLE_FONTS_LICENSE_DIRS:
+        url = f"https://api.github.com/repos/google/fonts/contents/{license_dir}/{slug}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "convertify-font-fetch"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                entries = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue  # not under this license dir - try the next one
+            print(f"[word-to-pdf] Google Fonts lookup for '{family}' failed: {e}")
+            return False
+        except Exception as e:
+            print(f"[word-to-pdf] Google Fonts lookup for '{family}' failed: {e}")
+            return False
+
+        ttf_entries = [e for e in entries if isinstance(e, dict) and e.get("name", "").endswith(".ttf")]
+        if not ttf_entries:
+            return False
+        # Prefer a plain static Regular weight over italic/bold variants, but a variable-axis
+        # file (the only kind some families ship, e.g. "Roboto[wdth,wght].ttf") still renders
+        # fine at its default instance, so fall back to whatever's first.
+        chosen = next(
+            (e for e in ttf_entries if "italic" not in e["name"].lower() and "bold" not in e["name"].lower()),
+            ttf_entries[0],
+        )
+        try:
+            os.makedirs(_DYNAMIC_FONTS_DIR, exist_ok=True)
+            dest = os.path.join(_DYNAMIC_FONTS_DIR, f"{slug}-{chosen['name']}")
+            if os.path.exists(dest):
+                return False  # an earlier request already fetched this family
+            dl_req = urllib.request.Request(chosen["download_url"], headers={"User-Agent": "convertify-font-fetch"})
+            with urllib.request.urlopen(dl_req, timeout=15) as resp:
+                data = resp.read()
+            with open(dest, "wb") as f:
+                f.write(data)
+            print(f"[word-to-pdf] fetched '{family}' from Google Fonts -> {dest}")
+            return True
+        except Exception as e:
+            print(f"[word-to-pdf] downloading '{family}' from Google Fonts failed: {e}")
+            return False
+    return False
+
+
+def _refresh_fonts_for_new_download() -> None:
+    """A newly downloaded font needs `fc-cache` to become visible to fontconfig at all - and,
+    since convert_with_soffice() keeps one LibreOffice process running persistently across
+    requests for speed (see USE_PERSISTENT_LIBREOFFICE), that already-running process also
+    needs restarting to see it, the same way a crashed listener gets restarted elsewhere in
+    this file. Costs ~25s, but only once per newly-seen font family - not per request."""
+    try:
+        subprocess.run(["fc-cache", "-f"], capture_output=True, timeout=30)
+    except Exception as e:
+        print(f"[word-to-pdf] fc-cache refresh failed: {e}")
+    if USE_PERSISTENT_LIBREOFFICE:
+        with _uno_listener_state_lock:
+            _start_uno_listener_locked()
+
+
+def ensure_word_fonts_available(input_path: str, ext: str) -> None:
+    """Best-effort, never blocks the conversion: detects any font this docx asks for that
+    isn't in _HANDLED_WORD_FONTS, and tries to fetch it from Google Fonts so LibreOffice can
+    render it exactly instead of silently falling back to a mismatched default (the failure
+    mode that took manual digging to diagnose for both Calibri and Aptos). A font Google
+    Fonts doesn't have - most notably Word's own proprietary defaults - just gets logged, the
+    same as before."""
+    if ext != ".docx":
+        return
+    try:
+        unhandled = _unhandled_docx_fonts(input_path)
+        if not unhandled:
+            return
+        print(
+            f"[word-to-pdf] fonts not in our known-substitute list (LibreOffice will fall "
+            f"back to its own generic default unless one of these is fetchable): {unhandled}"
+        )
+
+        fetched_any = False
+        with _dynamic_font_lock:
+            for family in unhandled:
+                key = family.lower()
+                if key in _dynamic_font_attempted:
+                    continue
+                got = _fetch_google_font(family)
+                _dynamic_font_attempted[key] = got
+                fetched_any = fetched_any or got
+
+        if fetched_any:
+            _refresh_fonts_for_new_download()
+    except Exception as e:
+        print(f"[word-to-pdf] font detection/fetch skipped: {e}")
+
+
 def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     """The actual blocking work for word/excel/ppt -> pdf: writes the upload to disk and
     runs it through LibreOffice. Must be called via run_in_threadpool - convert_with_soffice()
@@ -627,6 +835,7 @@ def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     validate_office_file(input_path, ext)
     prepare_excel_for_pdf(input_path, ext)
     prepare_word_for_pdf(input_path, ext)
+    ensure_word_fonts_available(input_path, ext)
 
     return convert_with_soffice(input_path, work_dir)
 

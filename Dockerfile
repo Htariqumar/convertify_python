@@ -18,11 +18,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-uno \
     python3-pip \
     ghostscript \
+    fontconfig \
     fonts-dejavu \
     fonts-liberation \
     fonts-crosextra-carlito \
     fonts-crosextra-caladea \
     && rm -rf /var/lib/apt/lists/*
+
+# Word's newest default theme font, "Aptos" (2023, replacing Calibri), has no freely
+# redistributable metric-compatible clone the way Carlito/Caladea cover Calibri/Cambria -
+# Microsoft's own Aptos font files require a separate license to install on a server (see
+# fontconfig-aliases.conf for the full explanation). This aliases "Aptos"/"Aptos Display"
+# to the Carlito/Caladea already installed above, so LibreOffice gets a reasonably close,
+# consistent substitute instead of fontconfig's own generic (and worse-matching) fallback.
+COPY fontconfig-aliases.conf /etc/fonts/local.conf
+RUN fc-cache -f
 
 # main.py keeps one LibreOffice instance running persistently (via `unoserver`, see
 # USE_PERSISTENT_LIBREOFFICE in main.py) instead of spawning a fresh one per request - that
