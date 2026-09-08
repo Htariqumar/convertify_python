@@ -551,6 +551,68 @@ def prepare_excel_for_pdf(input_path: str, ext: str) -> None:
         print(f"[excel-to-pdf] print-setup pre-processing skipped: {e}")
 
 
+# DrawingML text boxes/shapes (the kind Word inserts for a title/heading frame) carry a
+# <a:bodyPr> autofit setting. Word's default for these is <a:normAutofit/> ("Shrink text on
+# overflow") - Word keeps the box's fixed size and shrinks the *font* just enough for the
+# text to still fit on one line. LibreOffice's DOCX import does not replicate that font
+# shrinking: it keeps the original font size and lets the box's fixed size clip whatever
+# doesn't fit, so a heading that Word neatly shrinks to fit instead loses words off the
+# edge of the box in the converted PDF with no visual indication anything was cut.
+# <a:spAutoFit/> ("Resize shape to fit text") tells the importer to grow the box to contain
+# the text at full size instead - not pixel-identical to Word's shrunk-font rendering, but
+# it guarantees every word stays visible instead of silently disappearing.
+_DRAWINGML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_WORD_XML_AUTOFIT_PARTS = re.compile(r"^word/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$")
+
+
+def prepare_word_for_pdf(input_path: str, ext: str) -> None:
+    """Rewrites any 'shrink text on overflow' text box/shape in a .docx to 'resize shape to
+    fit text' instead, so LibreOffice's DOCX->PDF conversion doesn't clip text out of
+    title/heading boxes that Word itself would have rendered by shrinking the font. Only
+    .docx is a zip/XML container - legacy .doc has no such fix available."""
+    if ext != ".docx":
+        return
+    try:
+        from lxml import etree
+
+        with zipfile.ZipFile(input_path, "r") as zin:
+            names = zin.namelist()
+            parts = {name: zin.read(name) for name in names}
+
+        changed_any = False
+        for name in names:
+            if not _WORD_XML_AUTOFIT_PARTS.match(name):
+                continue
+            tree = etree.fromstring(parts[name])
+            part_changed = False
+            for body_pr in tree.iter():
+                if not body_pr.tag.endswith("}bodyPr"):
+                    continue
+                for child in list(body_pr):
+                    if child.tag.endswith("}normAutofit"):
+                        body_pr.remove(child)
+                        etree.SubElement(body_pr, f"{{{_DRAWINGML_NS}}}spAutoFit")
+                        part_changed = True
+            if part_changed:
+                parts[name] = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+                changed_any = True
+
+        if not changed_any:
+            return
+
+        # zipfile can't edit an entry in place - rewrite the whole archive with the
+        # changed parts substituted in, same compression, same member order.
+        tmp_path = input_path + ".tmp"
+        with zipfile.ZipFile(input_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                zout.writestr(item, parts[item.filename])
+        os.replace(tmp_path, input_path)
+    except Exception as e:
+        # Best-effort only - if the docx can't be parsed, fall back to LibreOffice's
+        # default conversion (with the clipping risk) rather than failing the request.
+        print(f"[word-to-pdf] textbox-autofit pre-processing skipped: {e}")
+
+
 def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     """The actual blocking work for word/excel/ppt -> pdf: writes the upload to disk and
     runs it through LibreOffice. Must be called via run_in_threadpool - convert_with_soffice()
@@ -564,6 +626,7 @@ def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     enforce_max_upload_size(input_path, MAX_OFFICE_UPLOAD_BYTES, _KIND_BY_EXT.get(ext.lower(), "document"))
     validate_office_file(input_path, ext)
     prepare_excel_for_pdf(input_path, ext)
+    prepare_word_for_pdf(input_path, ext)
 
     return convert_with_soffice(input_path, work_dir)
 
