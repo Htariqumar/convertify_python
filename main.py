@@ -929,7 +929,7 @@ _APTOS_FONTS = {"aptos", "aptos display"}
 # there's no way to compute the "correct" ratio - this is an empirical starting point, not a
 # measured one. Tune it based on real before/after page-count comparisons: raise it (closer
 # to 1.0) if converted PDFs still run long, lower it if they now run short.
-_APTOS_SIZE_SCALE = 0.92
+_APTOS_SIZE_SCALE = 0.90
 
 
 def _rpr_font_is_aptos(rpr, theme_fonts: dict) -> bool:
