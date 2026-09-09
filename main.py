@@ -603,6 +603,12 @@ def _fix_fragile_floating_images(tree) -> bool:
         position_v = anchor.find(f"{{{_WP_NS}}}positionV")
         if position_v is None or position_v.get("relativeFrom") not in ("paragraph", "line"):
             continue
+        # behindDoc="1" is a deliberate design choice - a watermark or decorative image meant
+        # to sit behind/around text, not flow with it. Forcing that inline would replace a
+        # subtle background layer with a big block image shoved into the reading order, which
+        # is a worse outcome than the drift bug this function exists to fix.
+        if anchor.get("behindDoc") == "1":
+            continue
 
         drawing = anchor.getparent()
         inline = etree.SubElement(drawing, f"{{{_WP_NS}}}inline")
