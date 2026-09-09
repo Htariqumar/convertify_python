@@ -1121,6 +1121,62 @@ def _run_pdf2docx_conversion(pdf_path: str, docx_path: str) -> None:
         raise RuntimeError(f"PDF to Word conversion failed: {stderr}")
 
 
+def _looks_scanned(pdf_path: str) -> bool:
+    """A PDF is treated as "scanned" when every page is essentially just a full-page
+    picture - little or no real text layer for pdf2docx to work with, which is exactly
+    what produces a near-empty .docx (pdf2docx has nothing to extract). Requiring every
+    page to match, not just one, avoids misclassifying an ordinary document that simply
+    has one full-page image on it somewhere (e.g. a cover page)."""
+    doc = fitz.open(pdf_path)
+    try:
+        if len(doc) == 0:
+            return False
+        for page in doc:
+            if len(page.get_text().strip()) >= 20:
+                return False
+            page_area = page.rect.width * page.rect.height
+            if page_area <= 0:
+                return False
+            has_full_page_image = False
+            for img in page.get_images(full=True):
+                for rect in page.get_image_rects(img[0]) or []:
+                    if (rect.width * rect.height) >= 0.6 * page_area:
+                        has_full_page_image = True
+                        break
+                if has_full_page_image:
+                    break
+            if not has_full_page_image:
+                return False
+        return True
+    finally:
+        doc.close()
+
+
+def _build_image_only_docx(pdf_path: str, docx_path: str) -> None:
+    """Fallback for a scanned PDF (see _looks_scanned): without OCR there's no text to
+    recover, so each page is embedded as a picture instead - not editable, but at least
+    the document's actual content reaches the user instead of an empty .docx. Callers
+    surface the "image-fallback" method name this returns via X-Conversion-Method so the
+    UI can tell the user the result isn't editable text, instead of implying it is."""
+    import docx
+    from docx.shared import Inches
+    from io import BytesIO
+
+    pdf = fitz.open(pdf_path)
+    try:
+        out_doc = docx.Document()
+        section = out_doc.sections[0]
+        usable_width_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
+        for page_index, page in enumerate(pdf):
+            if page_index > 0:
+                out_doc.add_page_break()
+            pix = page.get_pixmap(dpi=200)
+            out_doc.add_picture(BytesIO(pix.tobytes("png")), width=Inches(usable_width_in))
+        out_doc.save(docx_path)
+    finally:
+        pdf.close()
+
+
 def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str) -> str:
     """All the blocking work for pdf-to-word: writing the upload to disk, the pdf2docx
     conversion, and the spacing-fix passes below (all synchronous, CPU/IO-bound). Must be
@@ -1138,6 +1194,15 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
     # file path into the error message), and a password-protected one fails with no
     # clear message at all - both as an opaque 500 instead of a clear, actionable error.
     open_pdf_or_raise(temp_pdf_path).close()
+
+    # Scanned PDFs have no text layer for pdf2docx to work with - without this check it
+    # would run anyway and hand back a near-empty .docx with no explanation. We don't do
+    # OCR (see _looks_scanned/_build_image_only_docx), so the best honest option is to
+    # embed each page as a picture and let the endpoint flag it as non-editable via
+    # X-Conversion-Method, rather than silently returning something that looks broken.
+    if _looks_scanned(temp_pdf_path):
+        _build_image_only_docx(temp_pdf_path, temp_docx_path)
+        return "image-fallback"
 
     import docx
     import fitz
