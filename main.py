@@ -1121,6 +1121,87 @@ def _run_pdf2docx_conversion(pdf_path: str, docx_path: str) -> None:
         raise RuntimeError(f"PDF to Word conversion failed: {stderr}")
 
 
+def _fix_low_contrast_text(docx_path: str) -> None:
+    """pdf2docx reconstructs table/cell background shading and run text color from
+    separate signals in the source PDF, and the two don't always agree: a run's text
+    color (e.g. white, correctly read off white-on-dark-navy text in the source) can end
+    up paired with a cell shading pdf2docx couldn't properly attribute (observed as a
+    generic near-white "f8f9fb" placeholder instead of the source's actual dark fill) -
+    so the text is technically colored "correctly" but unreadable against its own
+    background. This isn't specific to any one PDF's content - any source PDF with a
+    colored text banner/box (headers, callouts, code blocks) can trigger it, since it's
+    pdf2docx's own shading-reconstruction accuracy that varies. Rather than trying to
+    recover pdf2docx's intended background (not recoverable from the .docx alone once
+    it's already wrong), this scans every run after conversion and forces safe, readable
+    contrast whenever a run's text color and its effective background shading are too
+    close in brightness to read - in either direction (light-on-light or, since an unset
+    run color defaults to Word's implicit black, dark-on-dark)."""
+    import docx
+    from docx.oxml.ns import qn
+    from docx.shared import RGBColor
+
+    LOW_CONTRAST_THRESHOLD = 60  # out of 255 "perceived brightness" units
+
+    def brightness(hex_color: str) -> float:
+        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+        return 0.299 * r + 0.587 * g + 0.114 * b
+
+    def _shd_fill(container) -> str | None:
+        if container is None:
+            return None
+        shd = container.find(qn("w:shd"))
+        if shd is None:
+            return None
+        fill = shd.get(qn("w:fill"))
+        return fill if fill and fill.lower() not in ("auto", "ffffff") else None
+
+    def _enclosing_tc(el):
+        parent = el.getparent()
+        while parent is not None and parent.tag != qn("w:tc"):
+            parent = parent.getparent()
+        return parent
+
+    def cell_shading_fill(paragraph_xml) -> str:
+        # A docx can shade either the paragraph itself or its enclosing table cell -
+        # check both, paragraph first since it's the more specific/closer scope.
+        fill = _shd_fill(paragraph_xml.find(qn("w:pPr")))
+        if fill:
+            return fill
+        tc = _enclosing_tc(paragraph_xml)
+        fill = _shd_fill(tc.find(qn("w:tcPr"))) if tc is not None else None
+        return fill or "FFFFFF"  # page background default
+
+    def fix_paragraphs(paragraphs):
+        for p in paragraphs:
+            try:
+                bg_bright = brightness(cell_shading_fill(p._p))
+            except (ValueError, IndexError):
+                continue
+            for run in p.runs:
+                if not run.text.strip():
+                    continue
+                color = run.font.color
+                text_hex = str(color.rgb) if color is not None and color.type is not None and color.rgb is not None else "000000"
+                try:
+                    text_bright = brightness(text_hex)
+                except (ValueError, IndexError):
+                    continue
+                if abs(text_bright - bg_bright) < LOW_CONTRAST_THRESHOLD:
+                    run.font.color.rgb = RGBColor(0, 0, 0) if bg_bright > 127 else RGBColor(0xFF, 0xFF, 0xFF)
+
+    try:
+        doc = docx.Document(docx_path)
+        fix_paragraphs(doc.paragraphs)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    fix_paragraphs(cell.paragraphs)
+        doc.save(docx_path)
+    except Exception:
+        # Best-effort readability pass - never let it fail the whole conversion.
+        pass
+
+
 def _looks_scanned(pdf_path: str) -> bool:
     """True when pdf2docx has (almost) no real text to work with on any page - which is
     what produces a near-empty .docx. Originally this also required a full-page raster
@@ -1582,6 +1663,10 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
         
     # 1. Primary conversion using pdf2docx (fast, good enough for most straightforward PDFs)
     _run_pdf2docx_conversion(temp_pdf_path, temp_docx_path)
+    # Applies regardless of what happens next (layout-mode or layout-mode-corrected) -
+    # the color/shading mismatch this fixes is baked into pdf2docx's own output and
+    # doesn't depend on the spacing-fix path taken below.
+    _fix_low_contrast_text(temp_docx_path)
 
     used_method = "layout-mode"
     if has_spacing_issue(temp_docx_path):
