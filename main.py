@@ -595,8 +595,26 @@ def _fix_fragile_floating_images(tree) -> bool:
     sitting right on the image's bottom edge instead of above it. So when a converted image's
     run is followed by a same-paragraph run that still has real text, that run gets moved
     after the image - restoring the "label, then image" reading order the offset used to
-    fake, instead of introducing this exact same class of glued-together bug."""
+    fake, instead of introducing this exact same class of glued-together bug.
+
+    Finally, an inline image is also now subject to normal pagination - a page break can land
+    mid-image (cutting it in half across two pages) or between a caption paragraph and the
+    image paragraph following it (label stranded on one page, image starting the next). Both
+    get a keepLines/keepNext hint to tell LibreOffice's pagination to avoid that, the same
+    "keep together" mechanism Word itself uses for exactly this."""
     from lxml import etree
+
+    def _ensure_ppr_flag(para, flag_tag: str) -> None:
+        # keepNext/keepLines must come near the very start of pPr's child sequence (right
+        # after pStyle) to stay schema-valid - every pPr seen in these documents has at most
+        # an rPr, which is only legal at the very end of that sequence, so inserting at
+        # position 0 is always correct here.
+        ppr = para.find(f"{{{_W_NS}}}pPr")
+        if ppr is None:
+            ppr = etree.Element(f"{{{_W_NS}}}pPr")
+            para.insert(0, ppr)
+        if ppr.find(f"{{{_W_NS}}}{flag_tag}") is None:
+            ppr.insert(0, etree.Element(f"{{{_W_NS}}}{flag_tag}"))
 
     changed = False
     for anchor in tree.findall(f".//{{{_WP_NS}}}anchor"):
@@ -637,6 +655,12 @@ def _fix_fragile_floating_images(tree) -> bool:
         if following_text_runs:
             para.remove(run)
             following_text_runs[-1].addnext(run)
+
+        _ensure_ppr_flag(para, "keepLines")
+        if not following_text_runs:
+            prev_para = para.getprevious()
+            if prev_para is not None and prev_para.tag == f"{{{_W_NS}}}p":
+                _ensure_ppr_flag(prev_para, "keepNext")
     return changed
 
 
