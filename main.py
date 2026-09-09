@@ -926,10 +926,14 @@ _APTOS_FONTS = {"aptos", "aptos display"}
 # substitute's wider average glyph metrics (see fontconfig-aliases.conf) making Aptos-set
 # text reflow to take up visibly more room - more line wraps, more pages - than it does in
 # Word at the same nominal point size. Aptos is proprietary with no public metrics data, so
-# there's no way to compute the "correct" ratio - this is an empirical starting point, not a
-# measured one. Tune it based on real before/after page-count comparisons: raise it (closer
-# to 1.0) if converted PDFs still run long, lower it if they now run short.
-_APTOS_SIZE_SCALE = 0.90
+# there's no way to compute this ratio from the font files directly - 0.77 comes from
+# measuring real converted output instead: counting characters-per-line on matching
+# paragraphs of a real test document at scale 0.90 (Word averaged ~95.7 chars/line over 3
+# full lines, the PDF only ~81.3 - an 0.850 ratio), giving 0.90 * 0.850 ≈ 0.77. Re-tune the
+# same way if real documents still don't match: compare characters-per-line on a few full
+# (non-wrapped-short) lines of the same paragraph between Word and the converted PDF, then
+# multiply this value by (PDF chars-per-line / Word chars-per-line).
+_APTOS_SIZE_SCALE = 0.77
 
 
 def _rpr_font_is_aptos(rpr, theme_fonts: dict) -> bool:
