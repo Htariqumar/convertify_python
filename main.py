@@ -1122,32 +1122,23 @@ def _run_pdf2docx_conversion(pdf_path: str, docx_path: str) -> None:
 
 
 def _looks_scanned(pdf_path: str) -> bool:
-    """A PDF is treated as "scanned" when every page is essentially just a full-page
-    picture - little or no real text layer for pdf2docx to work with, which is exactly
-    what produces a near-empty .docx (pdf2docx has nothing to extract). Requiring every
-    page to match, not just one, avoids misclassifying an ordinary document that simply
-    has one full-page image on it somewhere (e.g. a cover page)."""
+    """True when pdf2docx has (almost) no real text to work with on any page - which is
+    what produces a near-empty .docx. Originally this also required a full-page raster
+    image, on the assumption that "no text" meant a photographed/scanned page - but some
+    PDF generators (seen in real fee-challan PDFs from bank/university systems) render
+    their content as vector line-art instead of either text or a raster image, e.g. fonts
+    flattened to outline paths for print fidelity. That has no big image to detect, so the
+    original check missed it entirely and let it fall through to pdf2docx anyway - still
+    producing the same near-empty .docx this function exists to catch. The real, narrower
+    thing pdf2docx actually needs is extractable text, so that's the only thing checked
+    now, regardless of *why* a page doesn't have it. Requiring every page to fail this,
+    not just one, avoids misclassifying an ordinary document that just has one sparse page
+    (e.g. a title page)."""
     doc = fitz.open(pdf_path)
     try:
         if len(doc) == 0:
             return False
-        for page in doc:
-            if len(page.get_text().strip()) >= 20:
-                return False
-            page_area = page.rect.width * page.rect.height
-            if page_area <= 0:
-                return False
-            has_full_page_image = False
-            for img in page.get_images(full=True):
-                for rect in page.get_image_rects(img[0]) or []:
-                    if (rect.width * rect.height) >= 0.6 * page_area:
-                        has_full_page_image = True
-                        break
-                if has_full_page_image:
-                    break
-            if not has_full_page_image:
-                return False
-        return True
+        return all(len(page.get_text().strip()) < 20 for page in doc)
     finally:
         doc.close()
 
