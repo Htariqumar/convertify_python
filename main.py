@@ -1204,8 +1204,17 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
             long_words = 0
             total_words = 0
             for para in doc.paragraphs:
-                words = para.text.split()
-                for w in words:
+                for w in para.text.split():
+                    # Only ASCII-alphabetic words are plausible "pdf2docx glued two
+                    # words together" candidates - the same criterion split_token()
+                    # below uses to actually fix them. Without this filter, technical
+                    # documents with ASCII box-drawing diagrams (long lines with no
+                    # internal spaces) or lots of code identifiers/filenames/URLs
+                    # (dots, underscores, digits - all naturally long) tripped this on
+                    # documents pdf2docx had converted perfectly fine, discarding that
+                    # good output for the much cruder text-mode rebuild below.
+                    if not (w.isascii() and w.isalpha()):
+                        continue
                     total_words += 1
                     if len(w) >= 15:
                         long_words += 1
