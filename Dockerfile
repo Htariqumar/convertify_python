@@ -1,4 +1,12 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-trixie
+
+# Pinned to the Debian release explicitly (trixie) instead of the unqualified "3.11-slim",
+# which silently tracks whatever Debian release is current - a future rebuild could otherwise
+# jump to a newer Debian release with a different LibreOffice version with no code change on
+# our side, shifting conversion behavior (rendering quirks, font substitution, etc. can all
+# vary by LO version) without anything here explaining why. "trixie" is what "3.11-slim"
+# already resolves to right now (Debian 13, LibreOffice 25.2.3), so this pin doesn't change
+# anything about the image today - it just stops it from moving on its own later.
 
 # LibreOffice (word/excel/ppt <-> pdf, office thumbnails) and Ghostscript (compress-pdf,
 # pdf thumbnails) - both installed as normal Debian packages since this runs on a regular
