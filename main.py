@@ -1189,13 +1189,24 @@ def _fix_low_contrast_text(docx_path: str) -> None:
                 if abs(text_bright - bg_bright) < LOW_CONTRAST_THRESHOLD:
                     run.font.color.rgb = RGBColor(0, 0, 0) if bg_bright > 127 else RGBColor(0xFF, 0xFF, 0xFF)
 
+    def fix_table(table):
+        for row in table.rows:
+            for cell in row.cells:
+                fix_paragraphs(cell.paragraphs)
+                # pdf2docx nests a table inside a cell to represent a highlighted
+                # sub-box within a bigger one (confirmed on a real document: the exact
+                # same text appears twice, once in the outer cell and once in a table
+                # nested inside it, each with its own independent shading) - doc.tables
+                # only lists top-level tables, so without this a nested cell's contrast
+                # never gets checked at all.
+                for nested in cell.tables:
+                    fix_table(nested)
+
     try:
         doc = docx.Document(docx_path)
         fix_paragraphs(doc.paragraphs)
         for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    fix_paragraphs(cell.paragraphs)
+            fix_table(table)
         doc.save(docx_path)
     except Exception:
         # Best-effort readability pass - never let it fail the whole conversion.
@@ -1284,19 +1295,62 @@ def _recover_lost_backgrounds(pdf_path: str, docx_path: str) -> None:
         b = sum(s[2] for s in samples) // len(samples)
         return "%02x%02x%02x" % (r, g, b)
 
+    def cell_search_snippet(cell) -> str:
+        # A short snippet, not the whole (possibly multi-paragraph, e.g. a whole
+        # diagram block) cell text - much likelier to appear as one contiguous,
+        # literally-searchable run on the source page.
+        own = next((line.strip() for line in cell.text.splitlines() if line.strip()), "")
+        if own:
+            return own[:60]
+        # A wrapper cell holding only a nested table (see process_table) has no text
+        # of its own - borrow its nested content's snippet instead, since visually
+        # they occupy the same spot on the source page and should get the same
+        # recovered background.
+        for nested in cell.tables:
+            for nested_row in nested.rows:
+                for nested_cell in nested_row.cells:
+                    snippet = cell_search_snippet(nested_cell)
+                    if snippet:
+                        return snippet
+        return ""
+
+    def process_table(table, page, page_index, hit_offset):
+        for row in table.rows:
+            for cell in row.cells:
+                tcPr = cell._tc.find(qn("w:tcPr"))
+                shd = tcPr.find(qn("w:shd")) if tcPr is not None else None
+                if shd is not None and (shd.get(qn("w:fill")) or "").lower() == _PDF2DOCX_PLACEHOLDER_FILL:
+                    snippet = cell_search_snippet(cell)
+                    hits = page.search_for(snippet) if snippet else []
+                    if hits:
+                        key = (page_index, snippet)
+                        offset = hit_offset.get(key, 0)
+                        hit_offset[key] = offset + 1
+                        if offset < len(hits):
+                            color = sample_dominant_color(page, hits[offset])
+                            if color:
+                                shd.set(qn("w:fill"), color)
+                # pdf2docx nests a table inside a cell to represent a highlighted
+                # sub-box within a bigger one - confirmed on a real document: the exact
+                # same text appeared twice, once in the outer cell (correctly colored)
+                # and once in a table nested inside it (left on the placeholder fill,
+                # producing a visible white patch where the two overlapped). A plain
+                # top-level-only table walk never visits that nested copy at all.
+                for nested in cell.tables:
+                    process_table(nested, page, page_index, hit_offset)
+
     pdf = fitz.open(pdf_path)
     try:
         doc = docx.Document(docx_path)
         # pdf2docx puts each PDF page in its own Word section (pages can differ in size),
         # closed by a paragraph carrying a w:sectPr - walking the body in document order
-        # and counting those gives each table the source page it actually came from,
-        # rather than searching the whole PDF and getting tripped up by text that
-        # legitimately repeats across pages (running headers/footers, a title also
-        # appearing in a footer line - both seen on the real PDF this was built against).
-        # A per-(page, snippet) counter then also resolves same-page repeats (e.g. a
-        # title appearing once as the heading and again in that page's own footer) by
-        # taking each successive search hit in the order pdf2docx's own reconstruction
-        # produced the matching table, top to bottom.
+        # and counting those gives each top-level table the source page it actually came
+        # from (nested tables inherit it from their parent), rather than searching the
+        # whole PDF and getting tripped up by text that legitimately repeats across pages
+        # (running headers/footers, a title also appearing in a footer line - both seen
+        # on the real PDF this was built against). A per-(page, snippet) counter then
+        # also resolves same-page repeats by taking each successive search hit in the
+        # order pdf2docx's own reconstruction produced the matching table, top to bottom.
         page_index = 0
         hit_offset: dict[tuple[int, str], int] = {}
         for child in doc.element.body:
@@ -1308,31 +1362,8 @@ def _recover_lost_backgrounds(pdf_path: str, docx_path: str) -> None:
             if child.tag != qn("w:tbl"):
                 continue
             page = pdf[page_index] if page_index < len(pdf) else None
-            if page is None:
-                continue
-            for row in Table(child, doc).rows:
-                for cell in row.cells:
-                    tcPr = cell._tc.find(qn("w:tcPr"))
-                    shd = tcPr.find(qn("w:shd")) if tcPr is not None else None
-                    if shd is None or (shd.get(qn("w:fill")) or "").lower() != _PDF2DOCX_PLACEHOLDER_FILL:
-                        continue
-                    # A short snippet, not the whole (possibly multi-paragraph, e.g. a
-                    # whole diagram block) cell text - much likelier to appear as one
-                    # contiguous, literally-searchable run on the source page.
-                    snippet = next((line.strip() for line in cell.text.splitlines() if line.strip()), "")[:60]
-                    if not snippet:
-                        continue
-                    hits = page.search_for(snippet)
-                    if not hits:
-                        continue
-                    key = (page_index, snippet)
-                    offset = hit_offset.get(key, 0)
-                    hit_offset[key] = offset + 1
-                    if offset >= len(hits):
-                        continue
-                    color = sample_dominant_color(page, hits[offset])
-                    if color:
-                        shd.set(qn("w:fill"), color)
+            if page is not None:
+                process_table(Table(child, doc), page, page_index, hit_offset)
         doc.save(docx_path)
     except Exception:
         # Best-effort recovery pass - never let it fail the whole conversion.
