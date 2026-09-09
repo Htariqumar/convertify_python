@@ -15,6 +15,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -1095,6 +1096,31 @@ async def office_to_pdf_response(background_tasks: BackgroundTasks, file: Upload
             detail="We couldn't convert this file due to an unexpected server error. Please try again shortly.",
         )
 
+PDF2DOCX_TIMEOUT_SECONDS = 120
+
+
+def _run_pdf2docx_conversion(pdf_path: str, docx_path: str) -> None:
+    """Runs the pdf2docx layout-mode conversion (see pdf2docx_worker.py for why this is
+    a subprocess rather than an in-process call) and turns a timeout into the same
+    user-safe InvalidFileError the corrupt/password-protected checks use, rather than
+    a raw subprocess.TimeoutExpired reaching the endpoint as an opaque 500."""
+    worker_script = os.path.join(os.path.dirname(__file__), "pdf2docx_worker.py")
+    try:
+        result = subprocess.run(
+            [sys.executable, worker_script, pdf_path, docx_path],
+            capture_output=True,
+            timeout=PDF2DOCX_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise InvalidFileError(
+            "This PDF is too complex to convert automatically (it took too long to "
+            "process). Try a smaller file or fewer pages."
+        )
+    if result.returncode != 0 or not os.path.exists(docx_path):
+        stderr = result.stderr.decode(errors="ignore") if result.stderr else "unknown error"
+        raise RuntimeError(f"PDF to Word conversion failed: {stderr}")
+
+
 def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str) -> str:
     """All the blocking work for pdf-to-word: writing the upload to disk, the pdf2docx
     conversion, and the spacing-fix passes below (all synchronous, CPU/IO-bound). Must be
@@ -1105,7 +1131,14 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
     with open(temp_pdf_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
 
-    from pdf2docx import Converter
+    enforce_max_upload_size(temp_pdf_path, MAX_PDF_UPLOAD_BYTES, "PDF")
+    # Same corrupt/password-protected checks the pdf-to-excel and pdf-to-ppt pipelines
+    # already do - without this, a corrupt file reaches pdf2docx and fails with a raw,
+    # unhelpful library exception (which can also leak this service's internal temp
+    # file path into the error message), and a password-protected one fails with no
+    # clear message at all - both as an opaque 500 instead of a clear, actionable error.
+    open_pdf_or_raise(temp_pdf_path).close()
+
     import docx
     import fitz
 
@@ -1137,7 +1170,12 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
         import wordninja
 
         def split_token(token):
-            if not token.isalpha() or len(token) < 15:
+            # wordninja's dictionary/frequency model is English-only - on a non-Latin
+            # token (Urdu, Arabic, Hindi, etc.) it has no real basis to split on, and
+            # str.isalpha() alone doesn't exclude those scripts (Python counts their
+            # letters as alphabetic too). Restrict to ASCII letters so non-Latin text
+            # is left untouched instead of risking a nonsense split.
+            if not token.isascii() or not token.isalpha() or len(token) < 15:
                 return token
             parts = wordninja.split(token)
             if len(parts) <= 1 or ''.join(parts) != token:
@@ -1286,7 +1324,13 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
             y_top, y_bottom = bbox[1], bbox[3]
             font_size = item["font_size"]
             vertical_gap = y_top - state["last_y_bottom"]
-            is_bullet = item["full_text"].startswith(('•', '◦', '-', '*'))
+            # '-'/'*' only count as a bullet when followed by a space ("- Item"), not
+            # bare - otherwise a line starting with a negative number ("-5%") or a
+            # date/page range ("2020-2021") was wrongly forced onto its own paragraph
+            # instead of flowing with the text before it.
+            is_bullet = item["full_text"].startswith(('•', '◦')) or bool(
+                re.match(r'^[-*]\s', item["full_text"])
+            )
 
             start_new_para = True
             if state["p"] is not None:
@@ -1472,9 +1516,7 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
         out_doc.save(docx_path)
         
     # 1. Primary conversion using pdf2docx (fast, good enough for most straightforward PDFs)
-    cv = Converter(temp_pdf_path)
-    cv.convert(temp_docx_path, start=0, end=None)
-    cv.close()
+    _run_pdf2docx_conversion(temp_pdf_path, temp_docx_path)
 
     used_method = "layout-mode"
     if has_spacing_issue(temp_docx_path):
@@ -1505,6 +1547,9 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"X-Conversion-Method": used_method}
         )
+    except InvalidFileError as e:
+        remove_files([temp_pdf_path, temp_docx_path])
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         remove_files([temp_pdf_path, temp_docx_path])
         raise HTTPException(status_code=500, detail=str(e))
