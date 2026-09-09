@@ -1202,6 +1202,145 @@ def _fix_low_contrast_text(docx_path: str) -> None:
         pass
 
 
+# pdf2docx's own fallback fill for a table cell whose real background it couldn't
+# attribute (see docx.py/Cell.py in the pdf2docx package: a cell with bg_color=None gets
+# no explicit shading at all, so it inherits this color from the blank template pdf2docx
+# builds new documents from) - confirmed empirically: it shows up on unrelated boxes
+# (a page-wide header banner, individual label cells, a whole diagram block) within the
+# same source PDF, each with a genuinely different real background behind them, which
+# only makes sense if this is a constant placeholder rather than ever a real sampled
+# color. Not something pdf2docx exposes as a constant to import - the value itself is
+# the only handle we have on it.
+_PDF2DOCX_PLACEHOLDER_FILL = "f8f9fb"
+
+
+def _recover_lost_backgrounds(pdf_path: str, docx_path: str) -> None:
+    """Best-effort recovery for cells pdf2docx left on its placeholder fill (see
+    _PDF2DOCX_PLACEHOLDER_FILL) instead of the source PDF's real background - typically
+    a colored header/banner/code-block box, which pdf2docx's table-reconstruction only
+    detects reliably for some cells and not others even within the same box (observed on
+    a real document: one cell in a header correctly got the true dark-navy fill, its
+    immediate neighbor got this placeholder instead). The real color can't be recovered
+    from the .docx alone once it's already wrong, and reconstructing it by re-deriving
+    z-order among the source PDF's *vector* fill shapes is unreliable in general - a
+    decorative box is often several overlapping colored rectangles (a card background,
+    a banner on top of it, a highlight on top of that), and picking the "right" one back
+    out isn't something that generalizes safely across arbitrary PDFs.
+
+    Instead this renders the actual source page - which has already resolved all of that
+    layering into one final visual, the same way a human reading the PDF sees it - and
+    samples the real pixel color around where that cell's text sits on the page (found
+    via text search, since the .docx keeps no page/position link back to the PDF once
+    pdf2docx has produced it). Only applied when: the text is found on exactly one page
+    (an ambiguous multi-match, e.g. repeated header text, is not guessed at), and the
+    sampled region has one clearly dominant color (a noisy/inconclusive sample - e.g. one
+    that mostly landed on text glyphs rather than background - is left alone rather than
+    risking a wrong color). Runs before _fix_low_contrast_text, which still gets the
+    final say on text-color contrast against whatever background ends up here, recovered
+    or not."""
+    import docx
+    from docx.table import Table
+    from collections import Counter
+    from docx.oxml.ns import qn
+
+    def sample_dominant_color(page, rect) -> str | None:
+        # Sample only a thin ring in the padding around the matched text's tight bbox,
+        # not the interior - for a large/bold heading, glyph ink can cover well over half
+        # of the bbox's own area, so including the interior risks the "dominant" color
+        # actually being the text itself. The padding ring is guaranteed to fall just
+        # outside the glyphs, whatever their weight or size.
+        pad = 4  # points
+        dpi = 150
+        clip = fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad) & page.rect
+        if clip.is_empty:
+            return None
+        pix = page.get_pixmap(clip=clip, dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+        border_px = max(2, round(pad * dpi / 72 * 0.6))
+        if pix.width <= 2 * border_px or pix.height <= 2 * border_px:
+            return None
+        # Binned rather than exact-pixel-value counting: anti-aliasing along the text
+        # edges means "the background color" is actually dozens of very close but not
+        # identical shades, no single one of which is a majority on its own.
+        bin_size = 16
+        counts = Counter()
+        bin_samples = {}
+        for x in range(pix.width):
+            for y in range(pix.height):
+                if border_px <= x < pix.width - border_px and border_px <= y < pix.height - border_px:
+                    continue
+                r, g, b = pix.pixel(x, y)
+                key = (r // bin_size, g // bin_size, b // bin_size)
+                counts[key] += 1
+                bin_samples.setdefault(key, []).append((r, g, b))
+        total = sum(counts.values())
+        if total == 0:
+            return None
+        key, n = counts.most_common(1)[0]
+        if n < 0.5 * total:  # no clearly dominant color - ambiguous, don't guess
+            return None
+        samples = bin_samples[key]
+        r = sum(s[0] for s in samples) // len(samples)
+        g = sum(s[1] for s in samples) // len(samples)
+        b = sum(s[2] for s in samples) // len(samples)
+        return "%02x%02x%02x" % (r, g, b)
+
+    pdf = fitz.open(pdf_path)
+    try:
+        doc = docx.Document(docx_path)
+        # pdf2docx puts each PDF page in its own Word section (pages can differ in size),
+        # closed by a paragraph carrying a w:sectPr - walking the body in document order
+        # and counting those gives each table the source page it actually came from,
+        # rather than searching the whole PDF and getting tripped up by text that
+        # legitimately repeats across pages (running headers/footers, a title also
+        # appearing in a footer line - both seen on the real PDF this was built against).
+        # A per-(page, snippet) counter then also resolves same-page repeats (e.g. a
+        # title appearing once as the heading and again in that page's own footer) by
+        # taking each successive search hit in the order pdf2docx's own reconstruction
+        # produced the matching table, top to bottom.
+        page_index = 0
+        hit_offset: dict[tuple[int, str], int] = {}
+        for child in doc.element.body:
+            if child.tag == qn("w:p"):
+                p_pr = child.find(qn("w:pPr"))
+                if p_pr is not None and p_pr.find(qn("w:sectPr")) is not None:
+                    page_index += 1
+                continue
+            if child.tag != qn("w:tbl"):
+                continue
+            page = pdf[page_index] if page_index < len(pdf) else None
+            if page is None:
+                continue
+            for row in Table(child, doc).rows:
+                for cell in row.cells:
+                    tcPr = cell._tc.find(qn("w:tcPr"))
+                    shd = tcPr.find(qn("w:shd")) if tcPr is not None else None
+                    if shd is None or (shd.get(qn("w:fill")) or "").lower() != _PDF2DOCX_PLACEHOLDER_FILL:
+                        continue
+                    # A short snippet, not the whole (possibly multi-paragraph, e.g. a
+                    # whole diagram block) cell text - much likelier to appear as one
+                    # contiguous, literally-searchable run on the source page.
+                    snippet = next((line.strip() for line in cell.text.splitlines() if line.strip()), "")[:60]
+                    if not snippet:
+                        continue
+                    hits = page.search_for(snippet)
+                    if not hits:
+                        continue
+                    key = (page_index, snippet)
+                    offset = hit_offset.get(key, 0)
+                    hit_offset[key] = offset + 1
+                    if offset >= len(hits):
+                        continue
+                    color = sample_dominant_color(page, hits[offset])
+                    if color:
+                        shd.set(qn("w:fill"), color)
+        doc.save(docx_path)
+    except Exception:
+        # Best-effort recovery pass - never let it fail the whole conversion.
+        pass
+    finally:
+        pdf.close()
+
+
 def _looks_scanned(pdf_path: str) -> bool:
     """True when pdf2docx has (almost) no real text to work with on any page - which is
     what produces a near-empty .docx. Originally this also required a full-page raster
@@ -1663,9 +1802,13 @@ def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str)
         
     # 1. Primary conversion using pdf2docx (fast, good enough for most straightforward PDFs)
     _run_pdf2docx_conversion(temp_pdf_path, temp_docx_path)
-    # Applies regardless of what happens next (layout-mode or layout-mode-corrected) -
-    # the color/shading mismatch this fixes is baked into pdf2docx's own output and
-    # doesn't depend on the spacing-fix path taken below.
+    # Both apply regardless of what happens next (layout-mode or layout-mode-corrected) -
+    # the color/shading mismatch these fix is baked into pdf2docx's own output and
+    # doesn't depend on the spacing-fix path taken below. Order matters: recover real
+    # backgrounds first (while text colors are still pdf2docx's untouched originals),
+    # then let the contrast pass have the final say against whatever background a cell
+    # ends up with, recovered or not.
+    _recover_lost_backgrounds(temp_pdf_path, temp_docx_path)
     _fix_low_contrast_text(temp_docx_path)
 
     used_method = "layout-mode"
