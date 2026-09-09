@@ -933,7 +933,7 @@ _APTOS_FONTS = {"aptos", "aptos display"}
 # same way if real documents still don't match: compare characters-per-line on a few full
 # (non-wrapped-short) lines of the same paragraph between Word and the converted PDF, then
 # multiply this value by (PDF chars-per-line / Word chars-per-line).
-_APTOS_SIZE_SCALE = 0.77
+_APTOS_SIZE_SCALE = 0.82
 
 
 def _rpr_font_is_aptos(rpr, theme_fonts: dict) -> bool:
