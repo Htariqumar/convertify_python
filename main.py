@@ -44,6 +44,14 @@ GHOSTSCRIPT_BIN = os.environ.get("GHOSTSCRIPT_PATH", "gs")
 MAX_OFFICE_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES = 10 * 1024 * 1024
 
+# Must stay comfortably under both the Next.js->service request timeout (55s,
+# CONVERSION_TIMEOUT_MS in lib/pythonService.ts) and Vercel's hard 60s function ceiling
+# (maxDuration in app/api/converter/compress-pdf/route.ts). If Ghostscript were allowed to
+# run longer than that, the client would already have timed out (or Vercel would already
+# have killed the function) while Ghostscript kept burning CPU server-side for a response
+# nobody is waiting for anymore - this makes it fail fast and cleanly instead.
+GHOSTSCRIPT_COMPRESS_TIMEOUT_SECONDS = 45
+
 # word/excel/ppt -> pdf normally spawns a brand-new LibreOffice process per request (see
 # _convert_with_soffice_spawn below), and LibreOffice's own startup - initializing its UNO
 # service manager, fonts, config - is a fixed ~10-15s cost regardless of document size. Setting
@@ -2540,32 +2548,56 @@ async def convert_ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile
 
 def _compress_pdf_sync(file_obj, input_path: str, output_path: str, pdf_settings: str) -> tuple[int, int]:
     """All the blocking work for compress-pdf: writing the upload to disk and running
-    Ghostscript. Must be called via run_in_threadpool - Ghostscript can take up to its 100s
-    subprocess timeout, and calling it directly on the event loop would freeze every other
-    request this service is handling for that entire duration."""
+    Ghostscript. Must be called via run_in_threadpool - Ghostscript can take up to
+    GHOSTSCRIPT_COMPRESS_TIMEOUT_SECONDS, and calling it directly on the event loop would
+    freeze every other request this service is handling for that entire duration."""
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file_obj, buffer)
+
+    enforce_max_upload_size(input_path, MAX_PDF_UPLOAD_BYTES, "PDF")
+    # Same corrupt/password-protected checks every other PDF endpoint already runs (see
+    # open_pdf_or_raise). Without this, an empty or corrupt upload doesn't fail - Ghostscript
+    # happily writes out a brand-new, valid-looking, completely blank PDF instead of erroring,
+    # and a password-protected upload "succeeds" the same way: Ghostscript can't decrypt the
+    # pages it can't read, so it silently drops them and returns a blank document with none of
+    # the original content. Both looked like a successful compression to the caller with no
+    # error at all - this catches both cases up front instead.
+    open_pdf_or_raise(input_path).close()
+
     before_size = os.path.getsize(input_path)
 
-    result = subprocess.run(
-        [
-            GHOSTSCRIPT_BIN,
-            "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.4",
-            f"-dPDFSETTINGS={pdf_settings}",
-            "-dNOPAUSE",
-            "-dQUIET",
-            "-dBATCH",
-            f"-sOutputFile={output_path}",
-            input_path,
-        ],
-        capture_output=True,
-        timeout=100,
-    )
+    try:
+        result = subprocess.run(
+            [
+                GHOSTSCRIPT_BIN,
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                f"-dPDFSETTINGS={pdf_settings}",
+                "-dNOPAUSE",
+                "-dQUIET",
+                "-dBATCH",
+                f"-sOutputFile={output_path}",
+                input_path,
+            ],
+            capture_output=True,
+            timeout=GHOSTSCRIPT_COMPRESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Ghostscript compression timed out")
     if result.returncode != 0 or not os.path.exists(output_path):
         stderr = result.stderr.decode(errors="ignore") if result.stderr else "unknown error"
         raise RuntimeError(f"Ghostscript compression failed: {stderr}")
     after_size = os.path.getsize(output_path)
+
+    # Ghostscript re-encodes the whole content stream, which for small, text-only, or
+    # already-optimized PDFs routinely comes out LARGER than the original - its own
+    # structural overhead outweighs any savings. Serving that back as the "compressed" file
+    # would mean the user occasionally downloads a bigger file than they uploaded, with the
+    # UI reporting a nonsensical negative "savings" percentage. If compression didn't
+    # actually help, hand back the original untouched instead.
+    if after_size >= before_size:
+        shutil.copyfile(input_path, output_path)
+        after_size = before_size
     return before_size, after_size
 
 
@@ -2588,6 +2620,9 @@ async def convert_compress_pdf(
             media_type="application/pdf",
             headers={"X-Before-Size": str(before_size), "X-After-Size": str(after_size)},
         )
+    except InvalidFileError as e:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
