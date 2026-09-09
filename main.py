@@ -605,16 +605,18 @@ def _fix_fragile_floating_images(tree) -> bool:
     from lxml import etree
 
     def _ensure_ppr_flag(para, flag_tag: str) -> None:
-        # keepNext/keepLines must come near the very start of pPr's child sequence (right
-        # after pStyle) to stay schema-valid - every pPr seen in these documents has at most
-        # an rPr, which is only legal at the very end of that sequence, so inserting at
-        # position 0 is always correct here.
+        # keepNext/keepLines must come right after pStyle (if present) to stay schema-valid -
+        # every other pPr child legal alongside them (rPr, spacing, jc, ...) sorts later in
+        # OOXML's required sequence, so inserting right after pStyle (or at position 0 if
+        # there's no pStyle) is always correct regardless of what else is already in pPr.
         ppr = para.find(f"{{{_W_NS}}}pPr")
         if ppr is None:
             ppr = etree.Element(f"{{{_W_NS}}}pPr")
             para.insert(0, ppr)
         if ppr.find(f"{{{_W_NS}}}{flag_tag}") is None:
-            ppr.insert(0, etree.Element(f"{{{_W_NS}}}{flag_tag}"))
+            pstyle = ppr.find(f"{{{_W_NS}}}pStyle")
+            insert_at = list(ppr).index(pstyle) + 1 if pstyle is not None else 0
+            ppr.insert(insert_at, etree.Element(f"{{{_W_NS}}}{flag_tag}"))
 
     changed = False
     for anchor in tree.findall(f".//{{{_WP_NS}}}anchor"):
@@ -862,8 +864,14 @@ def _fetch_google_font(family: str) -> bool:
             dl_req = urllib.request.Request(chosen["download_url"], headers={"User-Agent": "convertify-font-fetch"})
             with urllib.request.urlopen(dl_req, timeout=15) as resp:
                 data = resp.read()
-            with open(dest, "wb") as f:
+            # Write-then-rename, not a direct write to `dest` - a failure partway through the
+            # write (disk full, process killed) would otherwise leave a truncated/corrupt file
+            # at `dest`, and the exists() check above would then treat that permanently-broken
+            # file as "already fetched", never retrying this family again.
+            tmp_dest = dest + ".tmp"
+            with open(tmp_dest, "wb") as f:
                 f.write(data)
+            os.replace(tmp_dest, dest)
             print(f"[word-to-pdf] fetched '{family}' from Google Fonts -> {dest}")
             return True
         except Exception as e:
@@ -905,15 +913,27 @@ def ensure_word_fonts_available(input_path: str, ext: str) -> None:
             f"back to its own generic default unless one of these is fetchable): {unhandled}"
         )
 
-        fetched_any = False
+        # The lock only guards the shared dict, never the network I/O in _fetch_google_font -
+        # that can take 8-15s+ per family, and holding a single global lock across it would
+        # serialize every concurrent conversion that hits this path, even ones after
+        # completely unrelated fonts. Claiming a family here (None = "in progress") before
+        # releasing the lock also stops two concurrent requests from fetching the same font
+        # twice.
+        to_fetch = []
         with _dynamic_font_lock:
             for family in unhandled:
                 key = family.lower()
                 if key in _dynamic_font_attempted:
                     continue
-                got = _fetch_google_font(family)
-                _dynamic_font_attempted[key] = got
-                fetched_any = fetched_any or got
+                _dynamic_font_attempted[key] = None
+                to_fetch.append(family)
+
+        fetched_any = False
+        for family in to_fetch:
+            got = _fetch_google_font(family)
+            with _dynamic_font_lock:
+                _dynamic_font_attempted[family.lower()] = got
+            fetched_any = fetched_any or got
 
         if fetched_any:
             _refresh_fonts_for_new_download()
