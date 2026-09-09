@@ -734,12 +734,14 @@ _HANDLED_WORD_FONTS = {
 }
 
 # w:asciiTheme="minorHAnsi" etc. point a run at whichever font theme1.xml assigns to the
-# "Body" (minor) or "Headings" (major) theme slot, instead of naming a font directly.
+# "Body" (minor) or "Headings" (major) theme slot, instead of naming a font directly - the
+# attribute name is always one of asciiTheme/hAnsiTheme/cstheme/eastAsiaTheme regardless of
+# which slot it points at; the *value* ("minorHAnsi" vs "majorHAnsi" etc.) is what says major
+# or minor, so the lookup below has to be keyed by that value, not the attribute name.
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-_THEME_ATTR_TO_SLOT = {
-    "asciiTheme": "minor", "hAnsiTheme": "minor", "cstheme": "minor", "eastAsiaTheme": "minor",
-    "majorHAnsiTheme": "major", "majorAsciiTheme": "major", "majorBidiTheme": "major",
-    "majorEastAsiaTheme": "major",
+_THEME_FONT_VALUE_TO_SLOT = {
+    "minorHAnsi": "minor", "minorAscii": "minor", "minorEastAsia": "minor", "minorBidi": "minor",
+    "majorHAnsi": "major", "majorAscii": "major", "majorEastAsia": "major", "majorBidi": "major",
 }
 
 
@@ -775,8 +777,9 @@ def _fonts_referenced_in_part(tree, theme_fonts: dict) -> set:
                 names.add(val)
                 literal_found = True
         if not literal_found:
-            for attr, slot in _THEME_ATTR_TO_SLOT.items():
-                if el.get(f"{{{_W_NS}}}{attr}") and theme_fonts.get(slot):
+            for attr in ("asciiTheme", "hAnsiTheme", "cstheme", "eastAsiaTheme"):
+                slot = _THEME_FONT_VALUE_TO_SLOT.get(el.get(f"{{{_W_NS}}}{attr}"))
+                if slot and theme_fonts.get(slot):
                     names.add(theme_fonts[slot])
     return names
 
@@ -918,6 +921,113 @@ def ensure_word_fonts_available(input_path: str, ext: str) -> None:
         print(f"[word-to-pdf] font detection/fetch skipped: {e}")
 
 
+_APTOS_FONTS = {"aptos", "aptos display"}
+# How much to shrink a font size that resolves to Aptos, to compensate for the Carlito
+# substitute's wider average glyph metrics (see fontconfig-aliases.conf) making Aptos-set
+# text reflow to take up visibly more room - more line wraps, more pages - than it does in
+# Word at the same nominal point size. Aptos is proprietary with no public metrics data, so
+# there's no way to compute the "correct" ratio - this is an empirical starting point, not a
+# measured one. Tune it based on real before/after page-count comparisons: raise it (closer
+# to 1.0) if converted PDFs still run long, lower it if they now run short.
+_APTOS_SIZE_SCALE = 0.96
+
+
+def _rpr_font_is_aptos(rpr, theme_fonts: dict) -> bool:
+    """True only when this <w:rPr> has an *explicit* font reference (literal or via a theme
+    attribute) that resolves to Aptos/Aptos Display. Deliberately never guesses for an rPr
+    with no font reference at all - a run or style with no <w:rFonts> of its own inherits its
+    font from elsewhere in the cascade (its style, or ultimately docDefaults), which this
+    function can't see from the element alone, so scaling its size here would risk shrinking
+    text that isn't even rendered in Aptos."""
+    if rpr is None:
+        return False
+    rfonts = rpr.find(f"{{{_W_NS}}}rFonts")
+    if rfonts is None:
+        return False
+    for attr in ("ascii", "hAnsi"):
+        val = rfonts.get(f"{{{_W_NS}}}{attr}")
+        if val and val.lower() in _APTOS_FONTS:
+            return True
+    for attr in ("asciiTheme", "hAnsiTheme"):
+        slot = _THEME_FONT_VALUE_TO_SLOT.get(rfonts.get(f"{{{_W_NS}}}{attr}"))
+        if slot and (theme_fonts.get(slot) or "").lower() in _APTOS_FONTS:
+            return True
+    return False
+
+
+def _scale_rpr_size(rpr, scale: float) -> bool:
+    changed = False
+    for tag in ("sz", "szCs"):
+        el = rpr.find(f"{{{_W_NS}}}{tag}")
+        if el is None:
+            continue
+        val = el.get(f"{{{_W_NS}}}val")
+        if val is None or not val.isdigit():
+            continue
+        scaled = max(2, round(int(val) * scale))  # floor of 2 half-points (1pt) as a sanity guard
+        if scaled != int(val):
+            el.set(f"{{{_W_NS}}}val", str(scaled))
+            changed = True
+    return changed
+
+
+def compensate_aptos_font_size(input_path: str, ext: str) -> None:
+    """Shrinks <w:sz>/<w:szCs> wherever they sit next to an explicit Aptos font reference -
+    docDefaults (which always has one, since the theme's body font is Aptos in every real
+    document seen so far), named styles, and individual runs - see _APTOS_SIZE_SCALE and
+    _rpr_font_is_aptos for why and how narrowly this is scoped. Best-effort: never blocks the
+    conversion if the docx can't be parsed."""
+    if ext != ".docx":
+        return
+    try:
+        from lxml import etree
+
+        with zipfile.ZipFile(input_path, "r") as zin:
+            names = zin.namelist()
+            parts = {name: zin.read(name) for name in names}
+
+        theme_fonts = _resolve_theme_fonts(parts["word/theme/theme1.xml"]) if "word/theme/theme1.xml" in names else {}
+        changed_any = False
+
+        styles_name = "word/styles.xml"
+        if styles_name in parts:
+            tree = etree.fromstring(parts[styles_name])
+            part_changed = False
+            default_rpr = tree.find(f"{{{_W_NS}}}docDefaults/{{{_W_NS}}}rPrDefault/{{{_W_NS}}}rPr")
+            if _rpr_font_is_aptos(default_rpr, theme_fonts):
+                part_changed |= _scale_rpr_size(default_rpr, _APTOS_SIZE_SCALE)
+            for style in tree.findall(f"{{{_W_NS}}}style"):
+                rpr = style.find(f"{{{_W_NS}}}rPr")
+                if _rpr_font_is_aptos(rpr, theme_fonts):
+                    part_changed |= _scale_rpr_size(rpr, _APTOS_SIZE_SCALE)
+            if part_changed:
+                parts[styles_name] = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+                changed_any = True
+
+        for name in names:
+            if not _WORD_XML_AUTOFIT_PARTS.match(name):
+                continue
+            tree = etree.fromstring(parts[name])
+            part_changed = False
+            for rpr in tree.findall(f".//{{{_W_NS}}}r/{{{_W_NS}}}rPr"):
+                if _rpr_font_is_aptos(rpr, theme_fonts):
+                    part_changed |= _scale_rpr_size(rpr, _APTOS_SIZE_SCALE)
+            if part_changed:
+                parts[name] = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+                changed_any = True
+
+        if not changed_any:
+            return
+
+        tmp_path = input_path + ".tmp"
+        with zipfile.ZipFile(input_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                zout.writestr(item, parts[item.filename])
+        os.replace(tmp_path, input_path)
+    except Exception as e:
+        print(f"[word-to-pdf] Aptos size-compensation skipped: {e}")
+
+
 def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     """The actual blocking work for word/excel/ppt -> pdf: writes the upload to disk and
     runs it through LibreOffice. Must be called via run_in_threadpool - convert_with_soffice()
@@ -933,6 +1043,7 @@ def _office_to_pdf_sync(file_obj, ext: str, work_dir: str) -> str:
     prepare_excel_for_pdf(input_path, ext)
     prepare_word_for_pdf(input_path, ext)
     ensure_word_fonts_available(input_path, ext)
+    compensate_aptos_font_size(input_path, ext)
 
     return convert_with_soffice(input_path, work_dir)
 
