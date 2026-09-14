@@ -198,20 +198,29 @@ class DocxBuilder:
         if rows == 0 or cols == 0:
             return
 
-        tbl = self.docx.add_table(rows=rows, cols=cols)
-        tbl.style = "Table Grid"
+        try:
+            tbl = self.docx.add_table(rows=rows, cols=cols)
+            tbl.style = "Table Grid"
 
-        for r_idx, row in enumerate(matrix):
-            for c_idx in range(cols):
-                if c_idx >= len(row) or row[c_idx] is None:
-                    continue
-                cell_data = row[c_idx]
-                cell = tbl.cell(r_idx, c_idx)
-                # Clear default empty paragraph then write spans
-                cell.paragraphs[0].clear()
-                self._add_spans_to_paragraph(
-                    cell.paragraphs[0], cell_data.spans
-                )
+            for r_idx, row in enumerate(matrix):
+                for c_idx in range(cols):
+                    if c_idx >= len(row) or row[c_idx] is None:
+                        continue
+                    cell_data = row[c_idx]
+                    cell = tbl.cell(r_idx, c_idx)
+                    p = cell.paragraphs[0]
+                    p.clear()
+                    p.paragraph_format.space_before = Pt(2)
+                    p.paragraph_format.space_after = Pt(2)
+
+                    if cell_data.spans:
+                        self._add_spans_to_paragraph(p, cell_data.spans)
+                    elif cell_data.text:
+                        run = p.add_run(cell_data.text)
+                        run.font.name = "Arial"
+                        run.font.size = Pt(10)
+        except Exception:
+            pass  # Never allow table formatting glitch to abort full document assembly
 
     def _render_image(self, block: Block) -> None:
         if not block.image_bytes:

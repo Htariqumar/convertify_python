@@ -28,6 +28,7 @@ from .analyzer.layout_extractor import LayoutExtractor
 from .analyzer.pdf_scanner import PDFScanner
 from .builder.docx_builder import DocxBuilder
 from .handlers.image_handler import ImageHandler
+from .handlers.table_handler import TableHandler
 from .models.document_schema import DocumentModel, DocumentPage, PageGeometry, Block
 
 
@@ -73,6 +74,7 @@ def convert(pdf_path: str, output_path: str) -> ConversionResult:
             )
 
         extractor = LayoutExtractor(doc)
+        table_handler = TableHandler()
         image_handler = ImageHandler(doc)
         doc_model = DocumentModel()
 
@@ -83,10 +85,19 @@ def convert(pdf_path: str, output_path: str) -> ConversionResult:
         for page in doc:
             doc_page: DocumentPage = extractor.extract_page(page)
             drawings = extractor.get_drawings(page.number)
-            doc_page.blocks = image_handler.process_page_visuals(
+
+            # 2a. Detect tables from grid lines and suppress table paragraphs
+            blocks_after_tables, remaining_drawings = table_handler.process_page_tables(
                 page=page,
                 existing_blocks=doc_page.blocks,
                 raw_drawings=drawings,
+            )
+
+            # 2b. Detect vector diagrams & raster images using non-table drawings
+            doc_page.blocks = image_handler.process_page_visuals(
+                page=page,
+                existing_blocks=blocks_after_tables,
+                raw_drawings=remaining_drawings,
             )
             doc_model.pages.append(doc_page)
             page_data.append((doc_page.blocks, doc_page.geometry))
