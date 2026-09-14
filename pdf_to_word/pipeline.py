@@ -27,6 +27,7 @@ from .analyzer.element_classifier import ElementClassifier
 from .analyzer.layout_extractor import LayoutExtractor
 from .analyzer.pdf_scanner import PDFScanner
 from .builder.docx_builder import DocxBuilder
+from .handlers.image_handler import ImageHandler
 from .models.document_schema import DocumentModel, DocumentPage, PageGeometry, Block
 
 
@@ -72,6 +73,7 @@ def convert(pdf_path: str, output_path: str) -> ConversionResult:
             )
 
         extractor = LayoutExtractor(doc)
+        image_handler = ImageHandler(doc)
         doc_model = DocumentModel()
 
         # Collect (blocks, geometry) per page for cross-page analysis
@@ -80,6 +82,12 @@ def convert(pdf_path: str, output_path: str) -> ConversionResult:
         # 2. Per-page extraction
         for page in doc:
             doc_page: DocumentPage = extractor.extract_page(page)
+            drawings = extractor.get_drawings(page.number)
+            doc_page.blocks = image_handler.process_page_visuals(
+                page=page,
+                existing_blocks=doc_page.blocks,
+                raw_drawings=drawings,
+            )
             doc_model.pages.append(doc_page)
             page_data.append((doc_page.blocks, doc_page.geometry))
 
