@@ -34,6 +34,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
+from ..handlers.font_mapper import FontMapper
 from ..models.document_schema import (
     Block,
     DocumentModel,
@@ -255,7 +256,7 @@ class DocxBuilder:
         run.bold   = span.is_bold
         run.italic = span.is_italic
         if span.font_name:
-            run.font.name = span.font_name
+            run.font.name = FontMapper.clean_font_name(span.font_name)
         if span.font_size > 0:
             run.font.size = Pt(span.font_size)
         try:

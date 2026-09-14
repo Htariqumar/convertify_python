@@ -28,8 +28,10 @@ from .analyzer.layout_extractor import LayoutExtractor
 from .analyzer.pdf_scanner import PDFScanner
 from .builder.docx_builder import DocxBuilder
 from .handlers.image_handler import ImageHandler
+from .handlers.list_handler import ListHandler
 from .handlers.table_handler import TableHandler
 from .models.document_schema import DocumentModel, DocumentPage, PageGeometry, Block
+from .postprocessor.text_cleaner import TextCleaner
 
 
 class InvalidFileError(ValueError):
@@ -105,11 +107,12 @@ def convert(pdf_path: str, output_path: str) -> ConversionResult:
         # 3. Cross-page: mark running headers / footers
         ElementClassifier.detect_headers_footers(page_data)
 
-        # 4. Per-page: reading order + semantic classification
+        # 4. Per-page: reading order + semantic classification + text cleanup
         for doc_page in doc_model.pages:
             doc_page.blocks = ElementClassifier.sort_reading_order(doc_page.blocks)
             ElementClassifier.classify_headings(doc_page.blocks)
-            ElementClassifier.classify_lists(doc_page.blocks)
+            doc_page.blocks = ListHandler.process_lists(doc_page.blocks)
+            doc_page.blocks = TextCleaner.clean_blocks(doc_page.blocks)
 
         # Metadata from PDF info dict
         info = doc.metadata or {}
