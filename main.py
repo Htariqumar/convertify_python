@@ -7,6 +7,7 @@ from openpyxl import Workbook
 from pptx import Presentation
 import fitz # PyMuPDF
 import tempfile
+from pdf_to_word import convert as modular_pdf_to_word_convert, InvalidFileError as ModularInvalidFileError
 import os
 from pathlib import Path
 import json
@@ -1439,8 +1440,35 @@ def _build_image_only_docx(pdf_path: str, docx_path: str) -> None:
         pdf.close()
 
 
+# ===========================================================================
+# PDF to Word Conversion Engine
+# Set USE_MODULAR_PDF_TO_WORD = False (or env USE_MODULAR_PDF_TO_WORD=false)
+# to instantly switch back to the legacy pdf2docx conversion logic below.
+# ===========================================================================
+USE_MODULAR_PDF_TO_WORD = os.environ.get("USE_MODULAR_PDF_TO_WORD", "true").lower() in ("true", "1", "yes")
+
 def _convert_pdf_to_word_sync(file_obj, temp_pdf_path: str, temp_docx_path: str) -> str:
-    """All the blocking work for pdf-to-word: writing the upload to disk, the pdf2docx
+    """PDF-to-Word conversion entry point.
+    Uses the new modular engine (pdf_to_word) by default.
+    If USE_MODULAR_PDF_TO_WORD is False, uses the legacy pdf2docx engine below.
+    """
+    if not USE_MODULAR_PDF_TO_WORD:
+        return _convert_pdf_to_word_sync_legacy(file_obj, temp_pdf_path, temp_docx_path)
+
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+
+    enforce_max_upload_size(temp_pdf_path, MAX_PDF_UPLOAD_BYTES, "PDF")
+
+    try:
+        result = modular_pdf_to_word_convert(temp_pdf_path, temp_docx_path)
+        return result.method
+    except ModularInvalidFileError as e:
+        raise InvalidFileError(str(e))
+
+
+def _convert_pdf_to_word_sync_legacy(file_obj, temp_pdf_path: str, temp_docx_path: str) -> str:
+    """[LEGACY] All the blocking work for pdf-to-word: writing the upload to disk, the pdf2docx
     conversion, and the spacing-fix passes below (all synchronous, CPU/IO-bound). Must be
     called via run_in_threadpool - otherwise a large/complex PDF blocks every other request
     this service is handling (every other conversion tool, for every other user) for
